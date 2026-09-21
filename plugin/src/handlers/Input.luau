@@ -112,9 +112,25 @@ local released = {}
 local landed = nil
 local aimed = nil
 local seenAt = nil
+--[[
+	Every pointer button, not just the left one.
+
+	This used to accept only MouseButton1 and Touch. A right click was delivered
+	and read by the game like any other -- `InputBegan` fired for it -- and this
+	watcher then ignored it, so the tool reported "the client read no pointer
+	event, it did not register at all" for a click that had registered perfectly.
+	That false alarm was mistaken for Wine swallowing right clicks. It was this
+	filter.
+]]
+local function isPointerInput(kind)
+	return kind == Enum.UserInputType.MouseButton1
+		or kind == Enum.UserInputType.MouseButton2
+		or kind == Enum.UserInputType.MouseButton3
+		or kind == Enum.UserInputType.Touch
+end
 local inputConnection = UserInputService.InputBegan:Connect(function(input)
 	local kind = input.UserInputType
-	if aimed ~= nil and (kind == Enum.UserInputType.MouseButton1 or kind == Enum.UserInputType.Touch) then
+	if aimed ~= nil and isPointerInput(kind) then
 		seenAt = { x = input.Position.X, y = input.Position.Y }
 		landed = { sent = aimed, seen = seenAt }
 	end

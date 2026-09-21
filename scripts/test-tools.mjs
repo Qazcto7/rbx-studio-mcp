@@ -44,11 +44,12 @@ const { registerExecTools } = await import("../dist/tools/exec.js");
 const { registerInputTools } = await import("../dist/tools/input.js");
 const registered = new Map();
 const calls = [];
+let nextInputReply = null;
 const context = {
   server: { registerTool(name, spec, handler) { registered.set(name, { spec, handler }); } },
   bridge: { async call(op, params, options) {
     calls.push({op, params, options});
-    return op === "exec.run" ? {ok:true,returned:["nil",{answer:42}],output:[],milliseconds:1} : {delivered:true,steps:1,player:"Alice"};
+    return op === "exec.run" ? {ok:true,returned:["nil",{answer:42}],output:[],milliseconds:1} : (nextInputReply ?? {delivered:true,steps:1,player:"Alice"});
   } },
 };
 registerExecTools(context);
@@ -89,6 +90,21 @@ process.stdout.write("client tool schemas: ok\n");
  const withKey = {kind:"release_all", key:"W"};
  await input.handler(z.object(input.spec.inputSchema).parse({steps:[withKey]}));
  assert.deepEqual(calls.at(-1).params.steps[0], withKey);
+}
+
+// "The client read no pointer event" is for a press that went unread. A plan that
+// only releases has nothing to read, and a right click that was read reports where
+// it landed instead of being called a failure.
+{
+ const parse = (steps) => z.object(input.spec.inputSchema).parse({steps});
+ const text = (result) => result.content[0].text;
+ const sent = {delivered:true,steps:1,player:"Alice",performed:["click"]};
+ nextInputReply = sent;
+ assert.match(text(await input.handler(parse([{kind:"click",x:1,y:1,button:"MouseButton2",action:"tap"}]))), /read no pointer event/, "an unread press still warns");
+ assert.doesNotMatch(text(await input.handler(parse([{kind:"click",x:1,y:1,button:"MouseButton2",action:"release"}]))), /read no pointer event/, "a release has nothing to read");
+ nextInputReply = {...sent, landed:{sent:{x:1,y:1},seen:{x:1,y:-57}}};
+ assert.doesNotMatch(text(await input.handler(parse([{kind:"click",x:1,y:1,button:"MouseButton2",action:"tap"}]))), /read no pointer event/, "a read right click is not a failure");
+ nextInputReply = null;
 }
 
 // Client relay threads die with the call: `settleSeconds` is forwarded, extends the

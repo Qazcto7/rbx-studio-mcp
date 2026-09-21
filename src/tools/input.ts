@@ -272,7 +272,12 @@ export function registerInputTools(context: ToolContext): void {
       }
       if (response.landed) {
         parts.push(landingNote(response.landed).trim());
-      } else if (response.performed?.some((kind) => kind === "click")) {
+      } else if (
+        response.performed?.some((kind) => kind === "click") &&
+        // A release produces no InputBegan, so there is nothing to have read: a
+        // plan that only lets go of buttons is not a click that failed to land.
+        args.steps.some((step) => step.kind === "click" && step.action !== "release")
+      ) {
         // A click went out and the client reported reading no pointer event at
         // all. That is the loud case -- it means the click did not register,
         // not that it landed somewhere unhelpful.
