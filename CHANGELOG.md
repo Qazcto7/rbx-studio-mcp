@@ -11,6 +11,12 @@ Fixes for running Studio under Wine/Vinegar on Linux, found while using the serv
 - The stale-plugin advice no longer says to click into the Studio window: that does not reload a plugin. It says to reinstall and quit Studio completely.
 - `animation op="preview"` no longer times out on single-keyframe (zero-length) animations. `build` pads an animation whose keyframes are all at time 0 with a repeat of the last one 0.1s later (and says so), and `preview` does the same to a zero-length id it is handed.
 - `input`: a `click` with `action="release"` used to press and then release the button; it now only releases. A press on a button that is already down (`duplicate button state`) is repaired instead of failing the step, and a tap is always released even if the relay is torn down mid-step.
+- `execute_luau target="client"` with the new `settleSeconds` failed on every call: the variable was used without being declared. Fixed, and covered by a test that drives the client path.
+- Bridge failover: `probeOwner` reused a keep-alive connection to a bridge that had just gone away and read the dead socket as "nobody home", so a takeover would sometimes not happen (the failover test failed about half the time). A refused or reset connection is now retried once; a timeout or an actual answer is judged as it stands.
+- `FailoverBridge.close()` now waits for a takeover already in progress, so a bridge closed while promoting no longer ends up holding the port with nothing to close it.
+- The panel's size-saving guard read an undeclared `unloading`, so it never guarded anything and a collapsing widget could overwrite the saved size. It is now declared and set when the plugin unloads.
+- `doctor` compares installed plugins with the hash of the plugin sources, as `studio_status` does, instead of `build/plugin-build-id.txt`, which is stale after a pull that has not been rebuilt.
+- `check:plugin` (and so `build:plugin` and `npm test`) now fails on any name that is neither declared nor a Roblox global; this is how the two undeclared-variable bugs above went unnoticed.
 
 ### Added
 - `input` step `kind="release_all"`: releases every mouse button (and an optional `key`) and reports what it found, as the way out of a stuck button.

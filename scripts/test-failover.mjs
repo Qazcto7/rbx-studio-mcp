@@ -308,4 +308,89 @@ function handshake(port, studioId) {
  }
 }
 
+// `close` must not return while a takeover it did not see is still under way.
+//
+// A call that finds the owner gone starts a takeover attempt in the background.
+// If `close` runs first and returns, the attempt can still win the port a moment
+// later and shut it down on its own schedule -- so whoever binds next finds the
+// port half gone. Here the attempt is slow on purpose: `close` has to outlast it.
+{
+  const { FailoverBridge } = await import("../dist/bridge/failover.js");
+  const { ToolError } = await import("../dist/lib/errors.js");
+  let released = false;
+  const gone = new ToolError("OWNER_GONE", "the owner went away");
+  const peer = { call: async () => { throw gone; }, goodbye: async () => {} };
+  const claim = () =>
+    new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            bridge: {},
+            close: async () => {
+              await new Promise((done) => setTimeout(done, 30));
+              released = true;
+            },
+          }),
+        80,
+      ),
+    );
+  const bridge = new FailoverBridge(peer, claim);
+  await assert.rejects(() => bridge.call("studio.status"), { code: "OWNER_GONE" });
+  await bridge.close();
+  assert.equal(released, true, "close waits for an attempt in flight and lets go of what it won");
+}
+
+// The owner behind a port can be replaced while this process still holds a pooled
+// keep-alive connection to the old one, and the first request then dies on the
+// dead socket before the new owner is ever asked. That used to be reported as
+// "something that is not roblox-studio-mcp" and stopped the server starting (the
+// failover test above tripped over it about half the time). A connection failure
+// is asked again on a fresh socket; an answer that is not ours, and a timeout,
+// are not.
+{
+  const { probeOwner } = await import("../dist/bridge/remote.js");
+  const realFetch = globalThis.fetch;
+  const ours = () =>
+    new Response(JSON.stringify({ server: "roblox-studio-mcp", protocolVersion: 1, pid: 1 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  try {
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("fetch failed", { cause: new Error("other side closed") });
+      return ours();
+    };
+    assert.ok(await probeOwner(PORT), "a dead pooled socket does not hide the real owner");
+    assert.equal(calls, 2);
+
+    calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      throw new TypeError("fetch failed");
+    };
+    assert.equal(await probeOwner(PORT), null, "nothing answering is still nothing");
+    assert.equal(calls, 2, "and is asked exactly twice");
+
+    calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    };
+    assert.equal(await probeOwner(PORT), null);
+    assert.equal(calls, 1, "a timeout is not retried: nobody is serving");
+
+    calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response("<html>not us</html>", { status: 200 });
+    };
+    assert.equal(await probeOwner(PORT), null, "a stranger's answer is an answer");
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 process.stdout.write("failover: ok\n");

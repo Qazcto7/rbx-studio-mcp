@@ -42,6 +42,17 @@ export class FailoverBridge implements StudioBridge {
   private watch: NodeJS.Timeout | null = null;
   private claiming = false;
   private stopped = false;
+  /**
+   * The attempt in progress, if any, so `close` can wait for it.
+   *
+   * An attempt that started before `close` may still win the port after it, and
+   * it then has to shut that server down itself. Without waiting, `close`
+   * resolved while a server it never saw was still binding or unbinding the
+   * port, and whoever started next on that port found it taken by something
+   * that was half gone: an EADDRINUSE with nobody answering, which reads as a
+   * stranger squatting on the port. Seen as a test failing about half the time.
+   */
+  private inflight: Promise<void> | null = null;
 
   /*
    * Remembered so a handover does not forget who we are. The MCP handshake
@@ -75,8 +86,15 @@ export class FailoverBridge implements StudioBridge {
    * it; binding is atomic, so at most one wins and the losers stay peers and
    * try again -- against, by then, the process that beat them.
    */
-  private async promote(): Promise<void> {
-    if (this.stopped || this.claiming || this.claimed !== null) return;
+  private promote(): Promise<void> {
+    if (this.stopped || this.claiming || this.claimed !== null) return Promise.resolve();
+    const attempt = this.attempt();
+    this.inflight = attempt;
+    return attempt;
+  }
+
+  /** One try at the port. Never rejects: a failure is next tick's problem. */
+  private async attempt(): Promise<void> {
     this.claiming = true;
     try {
       const port = await this.claim();
@@ -116,6 +134,10 @@ export class FailoverBridge implements StudioBridge {
   async close(): Promise<void> {
     this.stopped = true;
     this.stopWatching();
+    // Waited for before looking at `claimed`: an attempt in flight either closes
+    // what it won itself (it sees `stopped`) or finishes claiming it, and either
+    // way this must not return until the port is really let go.
+    await this.inflight;
     if (this.claimed !== null) await this.claimed.close();
   }
 

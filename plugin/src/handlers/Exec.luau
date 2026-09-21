@@ -145,6 +145,7 @@ function Exec.run(params: { [string]: any }): { [string]: any }
 	if params.target == "client" then
 		local player = ClientRelay.playerFor(params.player)
 		local timeout = math.clamp(tonumber(params.timeoutSeconds) or 30, 1, 300)
+		local settle = math.clamp(tonumber(params.settleSeconds) or 0, 0, 120)
 		local result = ClientRelay.run(player, "MCPExecRelay", [==[
 local report = script:WaitForChild("Report", 10)
 if not report then return end

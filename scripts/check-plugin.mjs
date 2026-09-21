@@ -90,16 +90,61 @@ for (const file of files) {
  */
 const TYPE_PATTERNS = [/Key '[^']+' not found in table/, /Cannot add property '[^']+' to table/];
 
+/*
+ * Globals Roblox provides, so the analyser (which has no definitions file here)
+ * reports them as unknown and they can be told apart from a name that is simply
+ * not declared.
+ *
+ * That difference is the point. The `LocalShadow` check above only catches a
+ * local declared LATER in the file. A name that is never declared anywhere
+ * (`settle` read inside a handler where the `local settle` was never written,
+ * `unloading` guarded in a function that never had it) is not shadowed by
+ * anything: at runtime it is a nil global, the guard is silently false, and the
+ * first time the line runs it fails with "attempt to perform arithmetic on nil"
+ * or does nothing at all. Both of those shipped, in a file the tests did not
+ * exercise, and both were "Unknown global" in the analyser's output the whole
+ * time -- buried under the hundreds of `Color3` and `UDim2` lines that made the
+ * filter ignore the message entirely.
+ *
+ * Anything not in this list is reported. If a real engine global trips it, add it
+ * here; that costs one line, and the alternative cost a broken release.
+ */
+const ENGINE_GLOBALS = new Set([
+  // Lua/Luau standard library
+  "assert", "bit32", "buffer", "collectgarbage", "coroutine", "debug", "error", "gcinfo", "getmetatable",
+  "ipairs", "loadstring", "math", "newproxy", "next", "os", "pairs", "pcall", "print", "rawequal", "rawget",
+  "rawlen", "rawset", "require", "select", "setmetatable", "string", "table", "tonumber", "tostring", "type",
+  "typeof", "unpack", "utf8", "xpcall", "_G", "_VERSION",
+  // Roblox functions and services
+  "delay", "elapsedTime", "plugin", "script", "settings", "shared", "spawn", "stats", "task", "tick", "time",
+  "UserSettings", "version", "wait", "warn", "workspace", "game", "Enum", "Instance",
+  // Roblox datatypes
+  "Axes", "BrickColor", "CFrame", "Color3", "ColorSequence", "ColorSequenceKeypoint", "Content", "DateTime",
+  "DockWidgetPluginGuiInfo", "Faces", "FloatCurveKey", "Font", "NumberRange", "NumberSequence",
+  "NumberSequenceKeypoint", "OverlapParams", "PathWaypoint", "PhysicalProperties", "Random", "Ray",
+  "RaycastParams", "Rect", "Region3", "Region3int16", "RotationCurveKey", "SharedTable", "TweenInfo", "UDim",
+  "UDim2", "Vector2", "Vector2int16", "Vector3", "Vector3int16", "CatalogSearchParams", "RaycastResult",
+]);
+
 const analyser = locateLuau("LUAU_ANALYZE", ["luau-analyze.exe", "luau-analyze"]);
 const shadowed = [];
 const mistyped = [];
+const undeclared = [];
 if (analyser !== null) {
   for (const file of files) {
     const result = spawnSync(analyser, [file], { encoding: "utf8" });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
     for (const line of output.split("\n")) {
-      if (line.includes("LocalShadow:")) shadowed.push(line.trim());
-      else if (TYPE_PATTERNS.some((pattern) => pattern.test(line))) mistyped.push(line.trim());
+      if (line.includes("LocalShadow:")) {
+        shadowed.push(line.trim());
+        continue;
+      }
+      const unknown = line.match(/Unknown global '([^']+)'/);
+      if (unknown !== null) {
+        if (!ENGINE_GLOBALS.has(unknown[1])) undeclared.push(line.trim());
+        continue;
+      }
+      if (TYPE_PATTERNS.some((pattern) => pattern.test(line))) mistyped.push(line.trim());
     }
   }
 }
@@ -161,6 +206,15 @@ if (shadowed.length > 0) {
       `${shadowed.join("\n")}\n`,
   );
 }
+if (undeclared.length > 0) {
+  process.stderr.write(
+    "\nA name is used that is not declared anywhere and is not a Roblox global. " +
+      "At runtime it is a nil global -- a guard that never guards, or an error the " +
+      "first time the line runs. Declare it, or, if it really is an engine global, " +
+      "add it to ENGINE_GLOBALS in this script:\n" +
+      `${undeclared.join("\n")}\n`,
+  );
+}
 if (mistyped.length > 0) {
   process.stderr.write(
     "\nA field is used on a table whose type does not declare it. It is nil at " +
@@ -169,4 +223,6 @@ if (mistyped.length > 0) {
 `,
   );
 }
-process.exit(failures.length > 0 || shadowed.length > 0 || mistyped.length > 0 ? 1 : 0);
+process.exit(
+  failures.length > 0 || shadowed.length > 0 || mistyped.length > 0 || undeclared.length > 0 ? 1 : 0,
+);

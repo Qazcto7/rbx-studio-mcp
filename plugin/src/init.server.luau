@@ -398,10 +398,17 @@ local function trace(what: string)
 	end)
 end
 
+-- Set once the plugin starts tearing down, so a widget that is collapsing with it
+-- does not write its shrunken size over the one the user chose. (Read below as a
+-- bare name before this existed, which Luau treats as a nil global: the guard was
+-- always false and never guarded anything.)
+local unloading = false
+
 if RunService:IsEdit() then
 	trace(string.format("load open=%s", tostring(storedOpen)))
 
 	plugin.Unloading:Connect(function()
+		unloading = true
 		trace("plugin.Unloading")
 	end)
 	widget.Destroying:Connect(function()

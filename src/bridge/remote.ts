@@ -38,19 +38,47 @@ const KEEPALIVE_MS = 30_000;
  * protocol version, no answer at all.
  */
 export async function probeOwner(port: number): Promise<OwnerIdentity | null> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/identity`, {
-      headers: { [CLIENT_HEADER]: "peer" },
-      signal: AbortSignal.timeout(2_000),
-    });
-    if (!response.ok) return null;
-    const body = (await response.json()) as Partial<OwnerIdentity>;
-    if (body.server !== "roblox-studio-mcp") return null;
-    if (body.protocolVersion !== PROTOCOL_VERSION) return null;
-    return body as OwnerIdentity;
-  } catch {
-    return null;
+  /*
+   * Asked twice when the first try dies on the network.
+   *
+   * `fetch` pools keep-alive sockets per host:port, and this process may still
+   * hold one to the PREVIOUS owner of the port. When that owner has since been
+   * replaced, the first request goes out on the dead socket and fails with
+   * "other side closed" before the new owner is ever asked -- so a perfectly
+   * healthy server was reported as "something that is not roblox-studio-mcp"
+   * and this one refused to start. Seen as the failover test failing about
+   * half the time, and it is the same sequence a real handover produces. The
+   * retry opens a fresh connection.
+   *
+   * Only a connection failure is retried. An answer that is not ours is an
+   * answer, and a timeout means nobody is serving -- neither improves on asking
+   * again.
+   */
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(`http://127.0.0.1:${port}/identity`, {
+        headers: { [CLIENT_HEADER]: "peer" },
+        signal: AbortSignal.timeout(2_000),
+      });
+    } catch (cause) {
+      const timedOut = cause instanceof Error && cause.name === "TimeoutError";
+      if (timedOut || attempt === 2) return null;
+      continue;
+    }
+
+    // Anything after this point is an answer, so it is judged, not retried.
+    try {
+      if (!response.ok) return null;
+      const body = (await response.json()) as Partial<OwnerIdentity>;
+      if (body.server !== "roblox-studio-mcp") return null;
+      if (body.protocolVersion !== PROTOCOL_VERSION) return null;
+      return body as OwnerIdentity;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 /**

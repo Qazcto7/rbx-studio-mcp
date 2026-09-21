@@ -51,8 +51,19 @@ function root(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-/** What this package would install, so an installed copy can be compared to it. */
+/**
+ * What this package would install, so an installed copy can be compared to it.
+ *
+ * The plugin sources are hashed directly, the same way `studio_status` does.
+ * `build/plugin-build-id.txt` is only what the LAST build stamped: after a
+ * `git pull` that has not been followed by a rebuild it still holds the old id,
+ * so preferring it made `doctor` say "up to date" for a checkout `studio_status`
+ * correctly called stale. The stamp is the fallback for a package that ships
+ * without plugin sources.
+ */
 function builtBuildId(): string | null {
+  const fromSources = expectedPluginBuildId();
+  if (fromSources !== "unknown") return fromSources;
   const stamp = join(root(), "build", "plugin-build-id.txt");
   if (!existsSync(stamp)) return null;
   return readFileSync(stamp, "utf8").trim();
@@ -86,7 +97,7 @@ async function checkPluginFiles(): Promise<Check[]> {
     ];
   }
 
-  const expected = builtBuildId() ?? expectedPluginBuildId();
+  const expected = builtBuildId();
   return dirs.map(({ dir, label }): Check => {
     const file = join(dir, "StudioMCP.rbxmx");
     const title = dirs.length > 1 ? `Studio plugin [${label}]` : "Studio plugin";
@@ -108,7 +119,7 @@ async function checkPluginFiles(): Promise<Check[]> {
           "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio and start it again.",
       };
     }
-    if (expected !== "unknown" && id !== expected) {
+    if (expected !== null && id !== expected) {
       return {
         status: "bad",
         title,
