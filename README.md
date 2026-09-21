@@ -19,7 +19,7 @@ After installing or updating the plugin, **quit Studio completely and start it a
 <details>
 <summary>Linux (Vinegar / Wine)</summary>
 
-`--install-plugin` looks for Studio's plugins folder in every Vinegar prefix (`~/.local/share/vinegar/prefixes/*` and the Flatpak one under `~/.var/app/org.vinegarhq.Vinegar`), `$WINEPREFIX` and `~/.wine`, and installs into each one it finds, because Studio may be running from either. To use some other folder:
+`--install-plugin` looks for Studio's plugins folder in every Vinegar prefix (`~/.local/share/vinegar/prefixes/*` and the Flatpak one under `~/.var/app/org.vinegarhq.Vinegar`), `$WINEPREFIX` and `~/.wine`, and installs into each one it finds, because Studio may be running from either. Where a prefix's registry moves `Local AppData` elsewhere (Vinegar does this for the prefixes it creates: `~/.local/share/vinegar/appdata`), that folder is used instead of the one inside the prefix. To use some other folder:
 
 ```bash
 STUDIO_MCP_PLUGINS_DIR=/path/to/AppData/Local/Roblox/Plugins npx -y @el4cteo/rbx-studio-mcp --install-plugin

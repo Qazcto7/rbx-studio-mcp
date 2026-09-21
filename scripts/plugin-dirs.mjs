@@ -22,9 +22,9 @@
  *
  * Nothing here has side effects; callers decide what to do with the list.
  */
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 
 /** Relative path from a Wine `users/<name>` directory to the plugins folder. */
 const PLUGINS_UNDER_USER = join("AppData", "Local", "Roblox", "Plugins");
@@ -42,6 +42,64 @@ function children(dir) {
 }
 
 /**
+ * Where a prefix's registry says `Local AppData` is, as a host path -- or null
+ * when it says nothing, and the profile folder inside the prefix applies.
+ *
+ * Vinegar moves it. When it creates a prefix it writes
+ * `User Shell Folders\Local AppData = Z:\home\<you>\.local\share\vinegar\appdata`,
+ * so Studio's `%LOCALAPPDATA%` -- and with it `Roblox\Plugins` -- is a folder
+ * OUTSIDE the prefix, shared by every prefix Vinegar makes. Looking only under
+ * `drive_c/users/<name>/AppData/Local`, as this file first did, finds nothing on
+ * a prefix made that way (or worse, an empty leftover folder that Studio never
+ * reads). The registry is what Studio itself asks, so it is what is read here.
+ *
+ * Only an absolute drive-letter path is trusted. Anything with `%VAR%` in it
+ * needs Wine to expand it, and guessing wrong is worse than using the default.
+ */
+function registeredLocalAppData(prefix) {
+  let reg;
+  try {
+    reg = readFileSync(join(prefix, "user.reg"), "utf8");
+  } catch {
+    return null;
+  }
+  const wanted = ["user shell folders", "shell folders"];
+  const found = {};
+  let section = null;
+  for (const line of reg.split(/\r?\n/)) {
+    if (line.startsWith("[")) {
+      const name = line.slice(1, line.indexOf("]")).replace(/\\\\/g, "\\").toLowerCase();
+      section = wanted.find((tail) => name.endsWith(`\\explorer\\${tail}`)) ?? null;
+      continue;
+    }
+    if (section === null) continue;
+    const match = /^"Local AppData"=(?:str\(\d+\):)?"((?:[^"\\]|\\.)*)"\s*$/i.exec(line);
+    if (match) found[section] = match[1].replace(/\\(.)/g, "$1");
+  }
+  const windows = found["user shell folders"] ?? found["shell folders"];
+  if (windows === undefined || windows.includes("%")) return null;
+
+  const drive = /^([A-Za-z]):[\\/]?(.*)$/.exec(windows);
+  if (drive === null) return null;
+  const letter = drive[1].toLowerCase();
+  const rest = drive[2].split(/[\\/]+/).filter(Boolean);
+
+  let root;
+  if (letter === "z") {
+    root = "/";
+  } else {
+    try {
+      root = readlinkSync(join(prefix, "dosdevices", `${letter}:`));
+      if (!isAbsolute(root)) root = resolve(join(prefix, "dosdevices"), root);
+    } catch {
+      if (letter !== "c") return null;
+      root = join(prefix, "drive_c");
+    }
+  }
+  return join(root, ...rest);
+}
+
+/**
  * Plugin folders inside one Wine prefix.
  *
  * A folder counts when Studio has been run there -- `Local/Roblox` exists -- even
@@ -51,6 +109,10 @@ function children(dir) {
  */
 function inPrefix(prefix, label) {
   const found = [];
+  const redirected = registeredLocalAppData(prefix);
+  if (redirected !== null && existsSync(redirected)) {
+    found.push({ dir: join(redirected, "Roblox", "Plugins"), label: `${label}, Local AppData redirect` });
+  }
   const users = join(prefix, "drive_c", "users");
   for (const user of children(users)) {
     if (user === "Public") continue;
