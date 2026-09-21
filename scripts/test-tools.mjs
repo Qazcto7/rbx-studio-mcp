@@ -81,6 +81,31 @@ for (const steps of [
 assert.deepEqual([...registered.keys()].sort(), ["execute_luau", "input", "viewport"]);
 process.stdout.write("client tool schemas: ok\n");
 
+// `release_all` is a step kind, and it survives the strict schema untouched.
+{
+ const releaseStep = {kind:"release_all"};
+ await input.handler(z.object(input.spec.inputSchema).parse({steps:[releaseStep]}));
+ assert.deepEqual(calls.at(-1).params.steps[0], releaseStep);
+ const withKey = {kind:"release_all", key:"W"};
+ await input.handler(z.object(input.spec.inputSchema).parse({steps:[withKey]}));
+ assert.deepEqual(calls.at(-1).params.steps[0], withKey);
+}
+
+// Client relay threads die with the call: `settleSeconds` is forwarded, extends the
+// deadline, and a spawn without it is called out in the reply.
+{
+ const settled = await execute.handler(z.object(execute.spec.inputSchema).parse({source:"return 1",target:"client",timeoutSeconds:2,settleSeconds:5}));
+ assert.equal(calls.at(-1).params.settleSeconds, 5);
+ assert.equal(calls.at(-1).options.timeoutMs, (2 + 5 + 10) * 1000);
+ assert.ok(!settled.content[0].text.includes("background threads"));
+ const spawned = await execute.handler(z.object(execute.spec.inputSchema).parse({source:"task.spawn(function() task.wait(3) end)",target:"client"}));
+ assert.match(spawned.content[0].text, /background threads/);
+ const waitedInline = await execute.handler(z.object(execute.spec.inputSchema).parse({source:"task.spawn(function() end)",target:"client",settleSeconds:3}));
+ assert.ok(!waitedInline.content[0].text.includes("background threads"));
+ const studioSpawn = await execute.handler(z.object(execute.spec.inputSchema).parse({source:"task.spawn(function() end)"}));
+ assert.ok(!studioSpawn.content[0].text.includes("background threads"), "the warning is for the client relay only");
+}
+
 const { registerDebugTools } = await import("../dist/tools/debug.js");
 registerDebugTools(context);
 const debug = registered.get("debug");
@@ -107,11 +132,27 @@ context.bridge.call = async (op, params) => {
  }
  return {changed:false,state:{playtestsAllowed:false}};
 };
+// The Linux/Wine multiplayer guard sits ahead of the plugin call, so the lock
+// behaviour is exercised with it opted out, and the guard itself is checked below.
+const priorAllow = process.env.STUDIO_MCP_ALLOW_MULTIPLAYER;
+process.env.STUDIO_MCP_ALLOW_MULTIPLAYER = "1";
 for (const op of ["play", "run", "multiplayer"]) {
  const result = await playtest.handler(z.object(playtest.spec.inputSchema).parse({op}));
  assert.equal(result.isError, true);
  assert.match(result.content[0].text, /PLAYTEST_DISABLED/);
  assert.match(result.content[0].text, /playtests on/);
+}
+if (priorAllow === undefined) delete process.env.STUDIO_MCP_ALLOW_MULTIPLAYER;
+else process.env.STUDIO_MCP_ALLOW_MULTIPLAYER = priorAllow;
+if (process.platform === "linux") {
+ delete process.env.STUDIO_MCP_ALLOW_MULTIPLAYER;
+ let sent = false;
+ context.bridge.call = async () => { sent = true; return {changed:true,state:{}}; };
+ const refused = await playtest.handler(z.object(playtest.spec.inputSchema).parse({op:"multiplayer"}));
+ assert.equal(refused.isError, true);
+ assert.match(refused.content[0].text, /MULTIPLAYER_UNSAFE/);
+ assert.equal(sent, false, "the refused multiplayer call must never reach Studio");
+ if (priorAllow !== undefined) process.env.STUDIO_MCP_ALLOW_MULTIPLAYER = priorAllow;
 }
 const stateResult = await playtest.handler(z.object(playtest.spec.inputSchema).parse({op:"state"}));
 assert.ok(!stateResult.isError);
@@ -160,3 +201,41 @@ for (const [name, args, expected] of [
 assert.ok(!editOps.includes("playtest.control"), "edit-mode tools never start or probe a simulation");
 context.bridge.call = normalCall;
 process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
+
+// Animation: the build reply labels the id preview-only, and `parent` reaches the plugin.
+{
+ const { registerAnimTools } = await import("../dist/tools/anim.js");
+ const { registerInstanceTools } = await import("../dist/tools/instances.js");
+ const tools = new Map();
+ const seen = [];
+ const animContext = {
+  server: { registerTool(name, spec, handler) { tools.set(name, { spec, handler }); } },
+  bridge: { async call(op, params) {
+   seen.push({op, params});
+   if (op === "anim.build") return {animationId:"a".repeat(32), keyframeCount:2, poseCount:1, hierarchy:"R6", instance:"Workspace.Rig.Tool.MCPAnimation", scope:"preview-only"};
+   if (op === "instances.modify" || op === "instances.create") return {items:[{path:"Workspace.Anim",className:"Animation",changed:["AnimationId"]}], undoStep:"MCP modify"};
+   throw new Error("unexpected " + op);
+  } },
+ };
+ registerAnimTools(animContext);
+ registerInstanceTools(animContext);
+ const anim = tools.get("animation");
+ const built = await anim.handler(z.object(anim.spec.inputSchema).parse({op:"build",parent:"Workspace.Rig.Tool",keyframes:[{time:0,poses:{"Right Arm":"0, 1, 0"}},{time:0.5}]}));
+ assert.equal(seen.at(-1).params.parent, "Workspace.Rig.Tool");
+ assert.match(built.content[0].text, /PREVIEW ONLY/);
+ assert.match(built.content[0].text, /RegisterKeyframeSequence/);
+ assert.match(built.content[0].text, /Workspace\.Rig\.Tool\.MCPAnimation/);
+ assert.match(anim.spec.description, /NEVER put a `build` id in the AnimationId/);
+
+ // A bare hash written to AnimationId is called out (also when nested under
+ // `children`); a real asset id and unrelated properties are not.
+ const { bareAnimationHashNote } = await import("../dist/tools/instances.js");
+ const hashed = "0123456789abcdef0123456789abcdef";
+ const warned = bareAnimationHashNote([{paths:["Workspace.Anim"],properties:{AnimationId:hashed}}]);
+ assert.match(warned, /bare hash/);
+ assert.match(warned, /T-pose/);
+ assert.match(bareAnimationHashNote([{className:"Tool",children:[{className:"Animation",properties:{AnimationId:hashed}}]}]), /bare hash/);
+ assert.equal(bareAnimationHashNote([{properties:{AnimationId:"rbxassetid://12345"}}]), undefined);
+ assert.equal(bareAnimationHashNote([{properties:{Name:hashed}}]), undefined);
+}
+process.stdout.write("animation: preview-only labelling and warnings ok\n");

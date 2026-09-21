@@ -73,6 +73,8 @@ end
 
 local virtual = UserInputService:CreateVirtualInput()
 local performed = {}
+-- What `release_all` found for each button, so a stuck one is visible.
+local released = {}
 
 --[[
 	Where the client actually read the last pointer event, against where it was
@@ -189,9 +191,40 @@ local ACCENT = Color3.fromRGB(255, 162, 0)
 local HOTSPOT = Vector2.new(0.36, 0.32)
 local HOTSPOT_FALLBACK = Vector2.new(0.484, 0.5)
 
+--[[
+	Inputs this relay pressed for the length of one step and has not yet let go of.
+
+	Recorded so that a relay which dies mid-step still lets go. A tap is press,
+	wait, release -- and the watchdog, or the script being destroyed, can land in
+	the middle of the wait. Nothing then sends the release, and the button stays
+	down in the client for good: measured under Wine, where it survived stopping
+	and restarting the playtest, and made the next press or tap fail with
+	"duplicate button state". In one case it also meant the game saw the left
+	button held and fired continuously.
+
+	Only taps are tracked. A `press` step is asked to stay down until a later
+	`release`, and letting go of it here would quietly undo what was requested.
+]]
+local tapping = { keys = {}, buttons = {} }
+local function releaseTransient()
+	for code in tapping.keys do
+		pcall(function()
+			virtual:SendKey(false, code, false)
+		end)
+	end
+	for button, at in tapping.buttons do
+		pcall(function()
+			virtual:SendMouseButton(at, button, false, 0)
+		end)
+	end
+	tapping.keys = {}
+	tapping.buttons = {}
+end
+
 local cursor = nil
 local cursorGui = nil
 local function cleanup()
+	releaseTransient()
 	inputConnection:Disconnect()
 	if cursorGui then cursorGui:Destroy() end
 end
@@ -331,6 +364,75 @@ local function refusedKey(key, err)
 	return string.format("%s was not sent: %s", key, message)
 end
 
+--[[
+	One mouse-button transition, tolerant of the button already being in that state.
+
+	The failure is "duplicate button state": the input system is told to press a
+	button it believes is already down, or release one already up. It comes from a
+	button left stuck by an earlier call, and it used to end the step outright --
+	so once a button stuck, every later click failed the same way and nothing in
+	the tool could clear it.
+
+	Pressing something already down is repaired: let go, then press, so the click
+	is a real one. Releasing something already up is not an error at all -- it is
+	exactly the state that was asked for.
+]]
+local function isDuplicate(err)
+	return string.find(string.lower(tostring(err)), "duplicate", 1, true) ~= nil
+end
+
+local function sendButton(at, button, down)
+	local ok, err = pcall(function()
+		virtual:SendMouseButton(at, button, down, 0)
+	end)
+	if ok then
+		return true, "sent"
+	end
+	if not isDuplicate(err) then
+		return false, tostring(err)
+	end
+	if not down then
+		return true, "already up"
+	end
+	pcall(function()
+		virtual:SendMouseButton(at, button, false, 0)
+	end)
+	task.wait(0.03)
+	local again, err2 = pcall(function()
+		virtual:SendMouseButton(at, button, true, 0)
+	end)
+	if again then
+		return true, "recovered from a stuck press"
+	end
+	return false, tostring(err2)
+end
+
+local function sendKey(code, down)
+	local ok, err = pcall(function()
+		virtual:SendKey(down, code, false)
+	end)
+	if ok then
+		return true, nil
+	end
+	if isDuplicate(err) then
+		if not down then
+			return true, nil
+		end
+		pcall(function()
+			virtual:SendKey(false, code, false)
+		end)
+		task.wait(0.03)
+		local again, err2 = pcall(function()
+			virtual:SendKey(true, code, false)
+		end)
+		if again then
+			return true, nil
+		end
+		return false, err2
+	end
+	return false, err
+end
+
 local function guiTarget(path)
 	local object = Players.LocalPlayer
 	for segment in string.gmatch(path, "[^%.]+") do
@@ -358,16 +460,18 @@ local function runStep(step): boolean
 	if kind == "key" then
 		local code = Enum.KeyCode[step.key]
 		local down = step.action ~= "release"
-		local sent, err = pcall(function()
-			virtual:SendKey(down, code, false)
-		end)
+		local sent, err = sendKey(code, down)
 		if not sent then
 			table.insert(notes, refusedKey(step.key, err))
 			return false
 		end
 		if down and step.action ~= "press" then
+			tapping.keys[code] = true
 			task.wait(step.hold or 0.08)
-			virtual:SendKey(false, code, false)
+			pcall(function()
+				virtual:SendKey(false, code, false)
+			end)
+			tapping.keys[code] = nil
 		end
 	elseif kind == "move" then
 		moveCursor(step.x, step.y, 0.3)
@@ -382,11 +486,57 @@ local function runStep(step): boolean
 		moveCursor(step.x, step.y, 0.3)
 		pulse()
 		virtual:SendMousePosition(at)
-		virtual:SendMouseButton(at, button, true, 0)
-		if step.action ~= "press" then
-			task.wait(step.hold or 0.05)
-			virtual:SendMouseButton(at, button, false, 0)
+		--[[
+			`release` lets go and nothing else.
+
+			It used to fall through to the press below, so a `release` step PRESSED
+			the button and then released it -- a full click, and one that fails with
+			"duplicate button state" precisely when the button was stuck down, which
+			is when someone reaches for `release` in the first place.
+		]]
+		if step.action == "release" then
+			local sent, how = sendButton(at, button, false)
+			if not sent then
+				table.insert(notes, string.format("%s was not released: %s", step.button or "MouseButton1", how))
+				return false
+			end
+		else
+			local sent, how = sendButton(at, button, true)
+			if not sent then
+				table.insert(notes, string.format("%s was not pressed: %s", step.button or "MouseButton1", how))
+				return false
+			end
+			if how ~= "sent" then
+				table.insert(notes, string.format("%s: %s.", step.button or "MouseButton1", how))
+			end
+			if step.action ~= "press" then
+				tapping.buttons[button] = at
+				task.wait(step.hold or 0.05)
+				sendButton(at, button, false)
+				tapping.buttons[button] = nil
+			end
 		end
+	elseif kind == "release_all" then
+		--[[
+			Lets go of every mouse button, and the named key if there is one.
+
+			The way out of a stuck button. Once the input system believes a button
+			is down, nothing else clears it -- stopping and restarting the playtest
+			does not, and every later press fails with "duplicate button state" --
+			so this sends a release for each button and reports what it found.
+			A button that was already up is not a failure; it is the answer.
+		]]
+		local at = Vector2.new(if aimed then aimed.x else 0, if aimed then aimed.y else 0)
+		for _, name in { "MouseButton1", "MouseButton2", "MouseButton3" } do
+			local sent, how = sendButton(at, Enum.UserInputType[name], false)
+			released[name] = if sent then how else ("failed: " .. how)
+		end
+		if step.key ~= nil then
+			local sent = sendKey(Enum.KeyCode[step.key], false)
+			released[step.key] = if sent then "sent" else "failed"
+		end
+		tapping.keys = {}
+		tapping.buttons = {}
 	elseif kind == "text" then
 		--[[
 			`SendTextInput` types into the FOCUSED TextBox and does nothing at
@@ -426,6 +576,8 @@ for index, step in plan do
 	-- Guarded so one failing step can never stop the report going back.
 	local ok, done = pcall(runStep, step)
 	if not ok then
+		-- A step that threw partway may have left a tap's button down.
+		releaseTransient()
 		table.insert(notes, string.format("step %d (%s) failed: %s", index - 1, tostring(step.kind), tostring(done)))
 	elseif done then
 		table.insert(performed, step.kind)
@@ -442,10 +594,12 @@ if cursorGui ~= nil then
 end
 
 task.cancel(watchdog)
+releaseTransient()
 inputConnection:Disconnect()
 report:FireServer({
 	ok = true,
 	performed = performed,
+	released = if next(released) ~= nil then released else nil,
 	landed = landed,
 	-- Sent only when there is something to say: an empty Lua table crosses as
 	-- an object rather than an array, and a caller iterating it would trip.
@@ -521,11 +675,23 @@ local function planFrom(params: { [string]: any }): { { [string]: any } }
 			end
 		elseif kind == "text" then
 			step.text = tostring(raw.text or "")
+		elseif kind == "release_all" then
+			-- Optionally also lets go of one key; the mouse buttons are always released.
+			if raw.key ~= nil then
+				local key = tostring(raw.key)
+				local okKey = pcall(function()
+					return (Enum.KeyCode :: any)[key]
+				end)
+				if not okKey or key == "" then
+					Dispatch.fail("BAD_KEY", string.format("Step %d: %q is not a KeyCode.", index, key))
+				end
+				step.key = key
+			end
 		else
 			Dispatch.fail(
 				"BAD_PARAMS",
 				string.format("Step %d: unknown kind %q.", index, kind),
-				'Use "key", "click", "move" or "text".'
+				'Use "key", "click", "move", "text" or "release_all".'
 			)
 		end
 
@@ -573,6 +739,8 @@ function Input.send(params: { [string]: any }): { [string]: any }
 		steps = #plan,
 		player = player.Name,
 		performed = result.performed,
+		-- Per-button outcome of a `release_all` step, when there was one.
+		released = result.released,
 		--[[
 			Named so the caller can tell why a click that was delivered still hit
 			nothing. `landed` carries the arithmetic; this says what to turn off.

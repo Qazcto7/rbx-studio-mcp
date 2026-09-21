@@ -18,6 +18,8 @@ interface InputResponse {
   steps: number;
   player: string;
   performed?: string[];
+  /** What a `release_all` step found for each button: "sent", "already up", or a failure. */
+  released?: Record<string, string>;
   /** Steps that were delivered and still did nothing, in the client's words. */
   notes?: string[];
 }
@@ -141,6 +143,14 @@ export function registerInputTools(context: ToolContext): void {
         "size since the picture was taken moves everything in it — measured, a " +
         "window that went from 435 to 952 pixels wide between a screenshot and " +
         "a click, where the click reported success and hit nothing.\n\n" +
+        "STUCK BUTTONS: under Wine the input system can be left believing a mouse " +
+        "button is still held after a call ends abnormally. Stopping and restarting " +
+        "the playtest does not clear it; the next press fails with 'duplicate button " +
+        "state', and a held left button auto-fires a gun. A step of " +
+        "kind \"release_all\" lets go of every mouse button and reports what it " +
+        "found for each. Send it whenever a click or tap fails that way, or " +
+        "ammo/behaviour suggests a button is held. A `click` with " +
+        "action \"release\" now sends only the release.\n\n" +
         "A `text` step types into the FOCUSED TextBox. Click the box in the same " +
         "call, one step before the text, and the focus is taken for you; with no " +
         "box to type into the step is reported as having done nothing rather " +
@@ -151,11 +161,13 @@ export function registerInputTools(context: ToolContext): void {
             z
               .object({
                 kind: z
-                  .enum(["key", "click", "move", "text"])
+                  .enum(["key", "click", "move", "text", "release_all"])
                   .default("key")
                   .describe(
                     "'key' presses a keyboard key, 'click' a mouse button at a " +
-                      "point, 'move' just moves the pointer, 'text' types a string.",
+                      "point, 'move' just moves the pointer, 'text' types a string, " +
+                      "'release_all' lets go of every mouse button (and `key` if given) " +
+                      "— the way out of a stuck button.",
                   ),
                 key: z
                   .string()
@@ -168,9 +180,9 @@ export function registerInputTools(context: ToolContext): void {
                   .optional()
                   .describe(
                     "'tap' presses and releases (the default), 'press' holds it " +
-                      "down until a later 'release', 'release' lets go. Use " +
-                      "press/release across steps to hold a key while doing " +
-                      "something else.",
+                      "down until a later 'release', 'release' lets go and sends no " +
+                      "press. Use press/release across steps to hold a key or button " +
+                      "while doing something else.",
                   ),
                 button: z
                   .enum(["MouseButton1", "MouseButton2", "MouseButton3"])
@@ -279,6 +291,19 @@ export function registerInputTools(context: ToolContext): void {
        */
       if (Array.isArray(response.notes)) {
         parts.unshift(...response.notes.map((line) => `WARNING: ${line}`));
+      }
+      if (response.released) {
+        const found = Object.entries(response.released)
+          .map(([button, outcome]) => `${button}: ${outcome}`)
+          .join(", ");
+        const held = Object.values(response.released).some((outcome) => outcome === "sent");
+        parts.push(
+          `Released — ${found}.` +
+            (held
+              ? " A release was actually sent for at least one button, so something " +
+                "had it held."
+              : " Every button was already up."),
+        );
       }
       const note = parts.join(" ");
       return json(response, note);

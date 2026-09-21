@@ -77,7 +77,22 @@ end
 
 local Runtime = {}
 Runtime.describe = describe
-function Runtime.run(chunk: () -> ...any, timeout: number?): { [string]: any }
+--[[
+	`settle` keeps the VM alive for that many seconds AFTER the chunk returns.
+
+	Built for the client relay, whose LocalScript is destroyed the moment the
+	call is answered -- and a destroyed script takes every thread it started with
+	it. A `task.spawn` loop that was meant to watch something for a few seconds
+	was cut off the instant the chunk that spawned it returned, so a test like
+	"fire, then watch the pose for three seconds" reported nothing and looked
+	like the game was broken. Waiting here keeps those threads running, and their
+	output is still captured, because the log connection is not closed until the
+	wait is over.
+
+	It is not persistence. Whatever is still running when `settle` ends is
+	stopped with the relay, exactly as before.
+]]
+function Runtime.run(chunk: () -> ...any, timeout: number?, settle: number?): { [string]: any }
 	-- Captured rather than inferred: a chunk's prints are usually the point, and
 	-- reading them back from the log afterwards would also pick up whatever else
 	-- the place logged in the meantime.
@@ -108,6 +123,13 @@ function Runtime.run(chunk: () -> ...any, timeout: number?): { [string]: any }
 		results = table.pack(pcall(chunk :: () -> ...any))
 	end
 	local elapsed = os.clock() - started
+
+	if settle ~= nil and settle > 0 then
+		local holdUntil = os.clock() + settle
+		while os.clock() < holdUntil do
+			task.wait()
+		end
+	end
 
 	--[[
 		MessageOut is deferred: `print` returns before the event fires, so

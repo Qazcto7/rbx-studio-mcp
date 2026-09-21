@@ -33,6 +33,7 @@ const suites = [
   { module: "plugin/src/RemoteTrace.luau", test: "tests/remote-trace.luau", prelude: "tests/remote-trace-stub.luau" },
   { module: "plugin/src/ExecRuntime.luau", test: "tests/exec-runtime.luau", prelude: "tests/exec-runtime-stub.luau" },
   { module: "plugin/src/ClientRelay.luau", test: "tests/client-relay.luau", prelude: "tests/client-relay-stub.luau" },
+  { module: "plugin/src/handlers/Anim.luau", test: "tests/anim.luau", prelude: "tests/anim-stub.luau" },
   { module: "plugin/src/TextEdit.luau", test: "tests/textedit.luau" },
   { module: "plugin/src/Format.luau", test: "tests/format.luau" },
 ];

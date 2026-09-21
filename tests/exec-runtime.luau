@@ -25,3 +25,13 @@ assert(not timeout.ok and string.find(timeout.error, "CLIENT_TIMEOUT"))
 assert(timeout.output[1].message == "before timeout" and cancelled and disconnected)
 local fast = runtime.run(function() return 42 end, 1)
 assert(fast.ok and fast.returned[1] == 42)
+
+-- `settle` keeps the VM alive after the chunk returns, so threads it started can
+-- finish before the relay is torn down; without it there is no extra wait.
+local beforeSettle = now
+local settled = runtime.run(function() return 1 end, nil, 2)
+assert(settled.ok and now - beforeSettle >= 2, "settle holds the runtime open")
+local beforePlain = now
+runtime.run(function() return 1 end)
+assert(now - beforePlain < 1, "no settle adds no wait")
+print("exec runtime settle: ok")

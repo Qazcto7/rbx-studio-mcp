@@ -155,10 +155,10 @@ local ok, result = pcall(function()
 	if not compiled then
 		return { ok = false, error = tostring(chunk), output = {}, milliseconds = 0 }
 	end
-	return runtime.run(chunk, script:GetAttribute("Timeout"))
+	return runtime.run(chunk, script:GetAttribute("Timeout"), script:GetAttribute("Settle"))
 end)
 report:FireServer(if ok then result else { ok = false, error = tostring(result), output = {}, milliseconds = 0 })
-]==], { Timeout = timeout }, timeout + 5, function(relay)
+]==], { Timeout = timeout, Settle = settle }, timeout + settle + 5, function(relay)
 			-- These modules are required ONLY by the LocalScript, sharing the game's client VM.
 			for _, name in { "ExecRuntime", "Serialize", "Paths", "Dispatch" } do
 				local copy = script.Parent.Parent[name]:Clone()

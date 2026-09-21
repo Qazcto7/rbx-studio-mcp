@@ -1,10 +1,10 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { CLIENT_HEADER, PROTOCOL_VERSION } from "./lib/protocol.js";
 import type { StudioSession } from "./lib/protocol.js";
 import { probeOwner } from "./bridge/remote.js";
+import { expectedPluginBuildId } from "./lib/pluginbuild.js";
 
 /**
  * Answers "why is this not working" without anyone having to guess.
@@ -27,14 +27,24 @@ export interface Check {
 
 const MARK: Record<Status, string> = { ok: "PASS", warn: "WARN", bad: "FAIL" };
 
-/** Studio's per-user plugin directory, which differs per platform. */
-function pluginsDir(): string | null {
-  if (process.platform === "win32") {
-    const local = process.env["LOCALAPPDATA"] ?? join(homedir(), "AppData", "Local");
-    return join(local, "Roblox", "Plugins");
-  }
-  if (process.platform === "darwin") return join(homedir(), "Documents", "Roblox", "Plugins");
-  return null;
+interface PluginDir {
+  dir: string;
+  label: string;
+}
+
+/**
+ * Every folder Studio might load plugins from.
+ *
+ * Read from `scripts/plugin-dirs.mjs`, the same module the installer writes
+ * through, so the two cannot disagree about where a plugin lives -- which is
+ * how a Linux machine ended up with the plugin freshly installed in one Wine
+ * prefix and Studio running from another.
+ */
+async function pluginDirs(): Promise<PluginDir[]> {
+  const module = (await import(pathToFileURL(join(root(), "scripts", "plugin-dirs.mjs")).href)) as {
+    pluginDirs: () => PluginDir[];
+  };
+  return module.pluginDirs();
 }
 
 function root(): string {
@@ -48,27 +58,68 @@ function builtBuildId(): string | null {
   return readFileSync(stamp, "utf8").trim();
 }
 
-function checkPluginFile(): Check {
-  const dir = pluginsDir();
-  if (dir === null) {
-    return {
-      status: "warn",
-      title: "Studio plugin",
-      detail:
-        "Roblox Studio does not run natively on this platform, so there is no " +
-        "plugins folder to check.",
-    };
+/**
+ * The build id stamped into an installed plugin, read from the file itself.
+ *
+ * The plugin carries it as a literal (`Config.BUILD_ID = "..."`), so a file on
+ * disk can be judged stale without Studio running at all.
+ */
+function installedBuildId(file: string): string | null {
+  try {
+    return /Config\.BUILD_ID = "([^"]+)"/.exec(readFileSync(file, "utf8"))?.[1] ?? null;
+  } catch {
+    return null;
   }
-  const file = join(dir, "StudioMCP.rbxmx");
-  if (!existsSync(file)) {
-    return {
-      status: "bad",
-      title: "Studio plugin",
-      detail: `Not installed. No file at ${file}.\n  Fix: npx rbx-studio-mcp --install-plugin`,
-    };
+}
+
+async function checkPluginFiles(): Promise<Check[]> {
+  const dirs = await pluginDirs();
+  if (dirs.length === 0) {
+    return [
+      {
+        status: "warn",
+        title: "Studio plugin",
+        detail:
+          "No Roblox Studio plugins folder found on this machine.\n" +
+          "  Run Studio once, or point at the folder with STUDIO_MCP_PLUGINS_DIR.",
+      },
+    ];
   }
-  const age = statSync(file).mtime.toISOString().slice(0, 16).replace("T", " ");
-  return { status: "ok", title: "Studio plugin", detail: `Installed ${age} at ${file}` };
+
+  const expected = builtBuildId() ?? expectedPluginBuildId();
+  return dirs.map(({ dir, label }): Check => {
+    const file = join(dir, "StudioMCP.rbxmx");
+    const title = dirs.length > 1 ? `Studio plugin [${label}]` : "Studio plugin";
+    if (!existsSync(file)) {
+      return {
+        status: dirs.length > 1 ? "warn" : "bad",
+        title,
+        detail: `Not installed. No file at ${file}.\n  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin`,
+      };
+    }
+    const age = statSync(file).mtime.toISOString().slice(0, 16).replace("T", " ");
+    const id = installedBuildId(file);
+    if (id === null) {
+      return {
+        status: "bad",
+        title,
+        detail:
+          `${file} carries no build id, so it is truncated or not a StudioMCP build (file dated ${age}).\n` +
+          "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio and start it again.",
+      };
+    }
+    if (expected !== "unknown" && id !== expected) {
+      return {
+        status: "bad",
+        title,
+        detail:
+          `Stale: ${file} is build ${id}, this package is ${expected} (file dated ${age}).\n` +
+          "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio " +
+          "completely and start it again. Focusing the window does not reload it.",
+      };
+    }
+    return { status: "ok", title, detail: `Installed ${age} at ${file}` };
+  });
 }
 
 /**
@@ -139,7 +190,7 @@ async function checkStudios(port: number, built: string | null): Promise<Check[]
       title: `Studio: ${session.placeName}`,
       detail: stale
         ? `Plugin build ${session.buildId} does not match this package's ${built}.\n` +
-          "  Fix: npx rbx-studio-mcp --install-plugin, then restart Studio."
+          "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio and start it again."
         : `${session.context ?? "edit"}, over ${session.transport}, plugin ${session.pluginVersion}`,
     };
   });
@@ -191,7 +242,7 @@ function checkLuau(): Check {
  */
 export async function collectChecks(port: number): Promise<Check[]> {
   const built = builtBuildId();
-  const checks: Check[] = [checkNode(), checkLuau(), checkPluginFile(), await checkPort(port)];
+  const checks: Check[] = [checkNode(), checkLuau(), ...(await checkPluginFiles()), await checkPort(port)];
   checks.push(...(await checkStudios(port, built)));
   return checks;
 }

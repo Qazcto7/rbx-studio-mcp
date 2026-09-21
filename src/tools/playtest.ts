@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ToolError } from "../lib/errors.js";
 import { json, type ToolResult } from "../lib/format.js";
 import { defineTool, type ToolContext } from "../lib/tool.js";
 
@@ -78,6 +79,11 @@ export function registerPlaytestTools(context: ToolContext): void {
         "a scripted check possible end to end: `args` is readable inside the test " +
         "via `StudioTestService:GetTestArgs()`, so a test can be told what to do " +
         "and report back what happened.\n\n" +
+        "On Linux (Studio under Wine/Vinegar) `multiplayer` is refused unless " +
+        "`force: true` is passed: it does not work reliably there and has crashed " +
+        "Studio outright. Use `play` with one player instead. `play`/`stop` can also " +
+        "sit in `testPending` for 30–90s on that setup — that is Studio being " +
+        "slow, not a failed call, so poll `state` rather than sending it again.\n\n" +
         "Stopping discards everything the playtest changed, exactly as pressing " +
         "Stop does. Build in edit mode, then play — not the other way round.\n\n" +
         "The reply says whether the mode actually moved, not merely that Studio " +
@@ -114,6 +120,13 @@ export function registerPlaytestTools(context: ToolContext): void {
             "Value handed to the test, readable inside it with " +
               "`StudioTestService:GetTestArgs()`. Use it to tell a test which " +
               "case to exercise.",
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            "multiplayer only: start it even on Linux/Wine, where it is refused by " +
+              "default because it can crash Studio.",
           ),
         studioId: z.string().optional().describe("Target Studio; omit for the active one."),
       },
@@ -191,6 +204,27 @@ export function registerPlaytestTools(context: ToolContext): void {
         }
       }
 
+      /*
+       * Refused before anything is sent. Under Wine, ExecuteMultiplayerTestAsync
+       * either never comes back or takes Studio down with it -- measured once
+       * as a full crash -- and there is no recovering the session afterwards, so
+       * the guard sits ahead of the call rather than reporting after it.
+       */
+      if (
+        args.op === "multiplayer" &&
+        process.platform === "linux" &&
+        args.force !== true &&
+        process.env["STUDIO_MCP_ALLOW_MULTIPLAYER"] !== "1"
+      ) {
+        throw new ToolError(
+          "MULTIPLAYER_UNSAFE",
+          "Multiplayer tests are disabled on Linux: Studio runs under Wine here, where " +
+            "this call is unreliable and has crashed Studio.",
+          'Use op="play" for a single-player test. To try it anyway, pass force: true ' +
+            "(or set STUDIO_MCP_ALLOW_MULTIPLAYER=1).",
+        );
+      }
+
       const response = await bridge.call<PlaytestResponse>(
         "playtest.control",
         { op: args.op, players: args.players, args: args.args },
@@ -212,6 +246,25 @@ export function registerPlaytestTools(context: ToolContext): void {
         notes.push(
           "The playtest runs in its own session. Call list_studios and target the " +
             "entry whose context is a playtest for console, performance and execute_luau.",
+        );
+      }
+
+      /*
+       * A test that has been "starting" for this long is almost certainly not
+       * failing, just slow -- under Wine the transition can hold for a minute or
+       * more and then complete on its own. Retrying `play` on top of it is what
+       * makes it worse (ALREADY_RUNNING at best, a wedged Studio at worst).
+       */
+      const waited = response.state.runningForSeconds ?? 0;
+      if (response.state.testPending && !response.state.isRunning && waited >= 20) {
+        notes.push(
+          `The test has been starting for ${waited}s without entering play mode. ` +
+            "Do not send `play` again; poll `state`" +
+            (process.platform === "linux"
+              ? " — under Wine this can take 30–90s and usually resolves by itself. " +
+                "If list_studios shows sessions as unreachable, wait a few minutes; " +
+                "restart Studio only if it never recovers."
+              : "."),
         );
       }
 

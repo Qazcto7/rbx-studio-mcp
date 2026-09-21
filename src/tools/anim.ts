@@ -52,10 +52,23 @@ export function registerAnimTools(context: ToolContext): void {
         "knowing: an R15 animation on an R6 character does nothing at all — no " +
         "error, no movement — and the asset id gives no hint either way.\n\n" +
         "`build` goes the other way: give it keyframes and it returns a content " +
-        "id you can put straight into an Animation's AnimationId. Nothing is " +
-        "uploaded and nothing is moderated — the id works in this Studio session " +
-        "and nowhere else, which makes it the right way to try an idea and the " +
-        "wrong way to ship one.\n\n" +
+        "id for `preview` and `read`. Nothing is uploaded and nothing is " +
+        "moderated — the id works in this Studio's EDIT session and nowhere " +
+        "else, which makes it the right way to try an idea and the wrong way to " +
+        "ship one.\n\n" +
+        "NEVER put a `build` id in the AnimationId of an Animation that a real " +
+        "playtest will load. LoadAnimation with it does not just fail — it " +
+        "breaks the character's whole Animator (full T-pose, every animation " +
+        "dead). For an animation that must run in the game, pass `parent` (e.g. " +
+        "the Tool): `build` then leaves a real KeyframeSequence instance there, " +
+        "and the CLIENT registers it at runtime with " +
+        "`KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)`, which " +
+        "returns a session-local id that does work in a live game.\n\n" +
+        "Give `build` at least two keyframes at different times. A single " +
+        "keyframe has zero length, and a zero-length animation cannot be " +
+        "previewed (the preview times out). A single or all-at-time-0 animation is " +
+        "padded automatically with a repeat of the last keyframe 0.1s later, and " +
+        "the reply says so — but writing two yourself is clearer.\n\n" +
         "`preview` puts an animation ONTO a rig in the open place and freezes it " +
         "at a chosen moment, so `screenshot` can show you the pose. It works in " +
         "edit mode — no playtest. Ask for several moments in turn to compare " +
@@ -63,7 +76,7 @@ export function registerAnimTools(context: ToolContext): void {
         "Poses are written the way a CFrame property is: \"0, 1, 0\" for a " +
         "position, \"0, 1, 0 | 0, 45, 0\" to rotate as well.\n\n" +
         "The id `build` returns is a bare hash, not an rbxassetid:// URL. Use it " +
-        "exactly as given — prefixing it stops it working.",
+        "exactly as given — prefixing it stops it working. It is preview-only.",
       inputSchema: {
         op: z
           .enum(["read", "preview", "build", "stop"])
@@ -98,6 +111,16 @@ export function registerAnimTools(context: ToolContext): void {
           .optional()
           .describe("build only: the keyframes, in any order — they are sorted by time."),
         name: z.string().optional().describe("build only: name for the sequence."),
+        parent: z
+          .string()
+          .optional()
+          .describe(
+            "build only: path to keep the built KeyframeSequence under as a real " +
+              'instance (e.g. "Workspace.Rig.Tool" or "ServerStorage"). This is how ' +
+              "to make an animation that works in a real playtest: the client " +
+              "registers the instance itself with " +
+              "KeyframeSequenceProvider:RegisterKeyframeSequence. One undo step.",
+          ),
         root: z
           .string()
           .optional()
@@ -161,6 +184,7 @@ export function registerAnimTools(context: ToolContext): void {
           {
             keyframes: args.keyframes,
             name: args.name,
+            parent: args.parent,
             root: args.root,
             rig: args.rig,
             priority: args.priority,
@@ -168,11 +192,22 @@ export function registerAnimTools(context: ToolContext): void {
           },
           { studioId: args.studioId, timeoutMs: TIMEOUT_MS },
         );
+        const kept = typeof built["instance"] === "string" ? built["instance"] : undefined;
         return json(
           built,
-          "Set this as an Animation's AnimationId with `modify`, exactly as it appears " +
-            "— it is a bare hash, and adding rbxassetid:// in front of it stops it " +
-            "working. Local to this Studio session: not uploaded, gone on restart.\n\n" +
+          "PREVIEW ONLY: use `animationId` with `animation op=preview` in this edit " +
+            "session, exactly as it appears (a bare hash; rbxassetid:// in front of it " +
+            "stops it working). Do NOT write it to an Animation that a playtest loads — " +
+            "that breaks the character's whole Animator (T-pose). Not uploaded, gone on " +
+            "restart.\n\n" +
+            (kept
+              ? `For the real game, the KeyframeSequence is kept at ${kept}. On the client:\n` +
+                "  local sequence = <that instance>\n" +
+                "  local anim = Instance.new(\"Animation\")\n" +
+                "  anim.AnimationId = game:GetService(\"KeyframeSequenceProvider\"):RegisterKeyframeSequence(sequence)\n" +
+                "  local track = humanoid.Animator:LoadAnimation(anim)\n" +
+                "Register it in the client VM, at runtime; the id is session-local.\n\n"
+              : "Pass `parent` to keep a real KeyframeSequence in the place for gameplay use.\n\n") +
             "`hierarchy` says which joint layout the poses were nested against — the " +
             "rig you named, or the R6/R15 standard guessed from the joint names. " +
             "Anything in `unmatchedJoints` is a name that layout does not contain: " +

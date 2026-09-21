@@ -1,0 +1,109 @@
+-- Just enough of the engine for Anim.build: instances that hold children, a
+-- KeyframeSequenceProvider that records what it was asked to register, and the
+-- three helper modules Anim.luau requires.
+local registered = {}
+local dataOf = {}
+
+local function make(class)
+	local data = { ClassName = class, Name = class, Time = 0, Weight = 0, Loop = false, kids = {}, destroyed = false }
+	local self
+	local methods = {}
+	function methods.GetChildren()
+		return data.kids
+	end
+	function methods.GetKeyframes()
+		local list = {}
+		for _, kid in data.kids do
+			if kid.ClassName == "Keyframe" then
+				table.insert(list, kid)
+			end
+		end
+		return list
+	end
+	function methods.Destroy()
+		data.destroyed = true
+	end
+	function methods.Clone()
+		local copy = make(class)
+		local copyData = dataOf[copy]
+		for key, value in data do
+			if key ~= "kids" and key ~= "Parent" and key ~= "destroyed" then
+				copyData[key] = value
+			end
+		end
+		for _, kid in data.kids do
+			kid:Clone().Parent = copy
+		end
+		return copy
+	end
+	self = setmetatable({}, {
+		__index = function(_, key)
+			if methods[key] then
+				return function(_, ...)
+					return methods[key](...)
+				end
+			end
+			return data[key]
+		end,
+		__newindex = function(_, key, value)
+			if key == "Parent" then
+				data.Parent = value
+				if value ~= nil then
+					table.insert(dataOf[value].kids, self)
+				end
+			else
+				data[key] = value
+			end
+		end,
+	})
+	dataOf[self] = data
+	return self
+end
+
+local Instance = {
+	new = function(class)
+		return make(class)
+	end,
+}
+CFrame = { new = function() return "identity" end }
+Enum = { AnimationPriority = {} }
+
+local KeyframeSequenceProvider = {
+	RegisterKeyframeSequence = function(_, sequence)
+		-- Snapshot the times now: `build` destroys the sequence after registering.
+		local times = {}
+		for _, frame in sequence:GetKeyframes() do
+			table.insert(times, frame.Time)
+		end
+		table.sort(times)
+		table.insert(registered, { sequence = sequence, times = times })
+		return string.rep("a", 31) .. tostring(#registered)
+	end,
+}
+local game = {
+	GetService = function()
+		return KeyframeSequenceProvider
+	end,
+}
+
+local Paths = {
+	resolve = function(_path)
+		return make("Folder")
+	end,
+	of = function(instance)
+		return "Workspace.Rig." .. instance.Name
+	end,
+}
+local Serialize = {
+	parse = function(text)
+		return true, "cf:" .. text, nil
+	end,
+	value = function(v)
+		return v
+	end,
+}
+local Undo = {
+	record = function(_, _, body)
+		return body(), true
+	end,
+}

@@ -14,6 +14,20 @@ npx -y @el4cteo/rbx-studio-mcp --install-plugin
 
 Or drop `StudioMCP.rbxmx` from [Releases](https://github.com/EL4CTEO/rbx-studio-mcp/releases) into your Studio plugins folder.
 
+After installing or updating the plugin, **quit Studio completely and start it again** — focusing the window does not reload a plugin.
+
+<details>
+<summary>Linux (Vinegar / Wine)</summary>
+
+`--install-plugin` looks for Studio's plugins folder in every Vinegar prefix (`~/.local/share/vinegar/prefixes/*` and the Flatpak one under `~/.var/app/org.vinegarhq.Vinegar`), `$WINEPREFIX` and `~/.wine`, and installs into each one it finds, because Studio may be running from either. To use some other folder:
+
+```bash
+STUDIO_MCP_PLUGINS_DIR=/path/to/AppData/Local/Roblox/Plugins npx -y @el4cteo/rbx-studio-mcp --install-plugin
+```
+
+`npx -y @el4cteo/rbx-studio-mcp doctor` lists each plugins folder and whether its copy matches this package. Under Wine, `playtest op="multiplayer"` is refused by default, `play`/`stop` can take 30–90s to settle, and Studio can stop answering for a few minutes at a time — poll `playtest op="state"` instead of retrying.
+</details>
+
 **2. The server**
 
 ```bash

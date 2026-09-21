@@ -113,9 +113,9 @@ export function protocolMismatchWarning(reported: number): string | null {
   if (reported === PROTOCOL_VERSION) return null;
   return reported < PROTOCOL_VERSION
     ? `The connected Studio plugin speaks an older wire protocol (v${reported}) than ` +
-        `this server (v${PROTOCOL_VERSION}). Studio only reloads a plugin when its ` +
-        `window next takes focus — click into Studio, then retry. If that does not ` +
-        `clear it, run \`npm run install:plugin\` and restart Studio.`
+        `this server (v${PROTOCOL_VERSION}). Run \`npx -y @el4cteo/rbx-studio-mcp --install-plugin\`, ` +
+        `then quit Studio completely and start it again — focusing the window does not ` +
+        `reload a plugin.`
     : `The connected Studio plugin speaks a newer wire protocol (v${reported}) than ` +
         `this server (v${PROTOCOL_VERSION}) understands. Update the server: reinstall ` +
         `with \`npx -y @el4cteo/rbx-studio-mcp\` (npx always fetches the latest).`;

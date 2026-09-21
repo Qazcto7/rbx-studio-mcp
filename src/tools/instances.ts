@@ -240,6 +240,28 @@ function undoNote(response: MutationResponse): string {
     : "Studio would not open an undo recording, so this is not undoable as one step";
 }
 
+/**
+ * A warning when a bare-hash animation id is being written to an AnimationId.
+ *
+ * `animation op="build"` returns a 32-character hash that only the edit-session
+ * preview understands. Written to an Animation that a real playtest then loads,
+ * `LoadAnimation` does not just fail -- it takes down the character's entire
+ * Animator, leaving a full T-pose with every animation dead, not only that one.
+ * Nothing in the write itself looks wrong, so the warning is attached to the
+ * reply where it cannot be missed. Scans the raw request (nested `children`
+ * included) instead of walking the schema, so it cannot fall behind it.
+ */
+export function bareAnimationHashNote(request: unknown): string | undefined {
+  if (!/"AnimationId"\s*:\s*"[0-9a-fA-F]{32}"/.test(JSON.stringify(request))) return undefined;
+  return (
+    "WARNING: that AnimationId is a bare hash from `animation op=\"build\"`, which is " +
+    "valid ONLY for `animation op=\"preview\"` in this edit session. If a playtest loads " +
+    "it with LoadAnimation, the character's whole Animator breaks (full T-pose). For " +
+    "gameplay, keep a real KeyframeSequence (`animation op=\"build\" parent=...`) and " +
+    "register it on the client with KeyframeSequenceProvider:RegisterKeyframeSequence()."
+  );
+}
+
 export function registerInstanceTools(context: ToolContext): void {
   const { bridge } = context;
 
@@ -280,7 +302,10 @@ export function registerInstanceTools(context: ToolContext): void {
         { instances: specs },
         { studioId: args.studioId, timeoutMs: 30_000 },
       );
-      return table(["path", "className"], response.items, { more: undoNote(response) });
+      const hashNote = bareAnimationHashNote(specs);
+      return table(["path", "className"], response.items, {
+        more: hashNote ? `${undoNote(response)}\n${hashNote}` : undoNote(response),
+      });
     },
   );
 
@@ -389,8 +414,9 @@ export function registerInstanceTools(context: ToolContext): void {
         { targets },
         { studioId: args.studioId, timeoutMs: 30_000 },
       );
+      const hashNote = bareAnimationHashNote(args.targets);
       return table(["path", "className", "changed"], response.items, {
-        more: undoNote(response),
+        more: hashNote ? `${undoNote(response)}\n${hashNote}` : undoNote(response),
       });
     },
   );

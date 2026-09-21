@@ -2,6 +2,23 @@
 
 What changed in each release, written for people using the server rather than for people reading the diff.
 
+## Unreleased
+
+Fixes for running Studio under Wine/Vinegar on Linux, found while using the server there day to day.
+
+### Fixed
+- **Stale plugin on Linux.** `--install-plugin` now finds Studio's plugins folder under Vinegar (native and Flatpak) and Wine prefixes and installs into every one it finds, instead of exiting on Linux. `STUDIO_MCP_PLUGINS_DIR` overrides the search. `doctor` checks each folder against this package's build id and flags a stale or truncated file.
+- The stale-plugin advice no longer says to click into the Studio window: that does not reload a plugin. It says to reinstall and quit Studio completely.
+- `animation op="preview"` no longer times out on single-keyframe (zero-length) animations. `build` pads an animation whose keyframes are all at time 0 with a repeat of the last one 0.1s later (and says so), and `preview` does the same to a zero-length id it is handed.
+- `input`: a `click` with `action="release"` used to press and then release the button; it now only releases. A press on a button that is already down (`duplicate button state`) is repaired instead of failing the step, and a tap is always released even if the relay is torn down mid-step.
+
+### Added
+- `input` step `kind="release_all"`: releases every mouse button (and an optional `key`) and reports what it found, as the way out of a stuck button.
+- `animation op="build"` takes `parent`, which keeps the built KeyframeSequence in the place as a real instance so the client can register it with `KeyframeSequenceProvider:RegisterKeyframeSequence`. This is the way to ship an animation to a real playtest.
+- `execute_luau target="client"` takes `settleSeconds`, which keeps the relay alive after the chunk returns so `task.spawn` threads can finish, and warns when code spawns threads without it.
+- `create`/`modify` warn when a bare-hash id from `animation op="build"` is written to an `AnimationId`: those ids are preview-only, and loading one in a playtest breaks the character's whole Animator.
+- `playtest op="multiplayer"` is refused on Linux unless `force: true` (or `STUDIO_MCP_ALLOW_MULTIPLAYER=1`); it is unreliable under Wine and has crashed Studio. A `play` that is slow to start now says to poll `state` rather than send it again.
+
 ## 0.7.6
 
 ### Fixed

@@ -102,7 +102,13 @@ export function registerExecTools(context: ToolContext): void {
         "Output is capped at 200 lines, 10 returns, table depth 4 and 50 entries. " +
         "The relay is removed on completion or timeout; non-yielding code can still stall the client. " +
         "Connections/hooks created by the temporary relay (such as Connect or RenderStepped) " +
-        "do not persist after the call returns.\n\n" +
+        "do not persist after the call returns — and neither do threads: a `task.spawn` " +
+        "loop is killed the moment the call returns, so a test that watches something " +
+        "over time must WAIT INSIDE THE SAME CALL (`task.wait` in the main chunk — the call " +
+        "stays open for that long, and that is reliable). If the code has to start " +
+        "background work and then let it run, pass `settleSeconds`: the relay is kept " +
+        "alive that long after the chunk returns, and output from those threads is still " +
+        "captured. Two separate calls never share a coroutine.\n\n" +
         "`target=\"live\"` runs the script on Roblox's servers against the " +
         "PUBLISHED place instead, with no Studio involved. That is how you " +
         "read or repair production: a real player's data store entry, what " +
@@ -140,6 +146,16 @@ export function registerExecTools(context: ToolContext): void {
           .max(300)
           .optional()
           .describe("live/client only: timeout in seconds. Defaults to 30."),
+        settleSeconds: z
+          .number()
+          .min(0)
+          .max(120)
+          .optional()
+          .describe(
+            "client only: keep the relay alive this many seconds after the chunk " +
+              "returns, so task.spawn/task.delay threads can finish. Default 0. Anything " +
+              "still running afterwards is stopped with the relay.",
+          ),
         confirm: z
           .boolean()
           .optional()
@@ -182,8 +198,20 @@ export function registerExecTools(context: ToolContext): void {
 
       const response = await bridge.call<ExecResponse>(
         "exec.run",
-        { source: args.source, target: args.target, player: args.player, timeoutSeconds: args.timeoutSeconds },
-        { studioId: args.studioId, timeoutMs: args.target === "client" ? ((args.timeoutSeconds ?? 30) + 10) * 1000 : 60_000 },
+        {
+          source: args.source,
+          target: args.target,
+          player: args.player,
+          timeoutSeconds: args.timeoutSeconds,
+          settleSeconds: args.settleSeconds,
+        },
+        {
+          studioId: args.studioId,
+          timeoutMs:
+            args.target === "client"
+              ? ((args.timeoutSeconds ?? 30) + (args.settleSeconds ?? 0) + 10) * 1000
+              : 60_000,
+        },
       );
 
       const parts: string[] = [];
@@ -212,6 +240,23 @@ export function registerExecTools(context: ToolContext): void {
       }
 
       if (response.note) parts.push(`Note: ${response.note}`);
+      /*
+       * The client relay dies with the call, and so does everything it started.
+       * Said whenever the source spawns something and no settle time was asked
+       * for, because the failure is silent: the watcher never runs, prints
+       * nothing, and the test reads as "the game did nothing".
+       */
+      if (
+        args.target === "client" &&
+        (args.settleSeconds ?? 0) === 0 &&
+        /\btask\.(spawn|delay|defer)\b|\bcoroutine\.(wrap|create)\b/.test(args.source)
+      ) {
+        parts.push(
+          "Note: this code starts background threads, and the client relay is removed " +
+            "when this call returns, which stops them. If they were meant to keep " +
+            "running, wait for them inside this call (task.wait) or pass `settleSeconds`.",
+        );
+      }
       parts.push(`(${response.milliseconds}ms)`);
       return response.ok ? text(parts.join("\n\n")) : errorText(parts.join("\n\n"));
     },

@@ -1,41 +1,28 @@
 /**
- * Builds the plugin and drops it into the local Roblox Studio plugins folder.
- *
- * Studio watches that directory and hot-reloads, so re-running this while Studio
- * is open picks up the new build without a restart.
+ * Builds the plugin and drops it into every Roblox Studio plugins folder it can find.
  *
  * Usage: node scripts/install-plugin.mjs
+ *
+ * After it runs, RESTART STUDIO. Studio loads plugins at startup; clicking back
+ * into the window does not reload them. (On Windows and macOS it sometimes
+ * appears to, which is where the older advice came from -- under Wine it does
+ * not, and a plugin installed while Studio was open kept running the old build.)
  */
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { noPluginsDirMessage, pluginDirs } from "./plugin-dirs.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const built = join(root, "build", "StudioMCP.rbxmx");
 
-/** Studio's per-user plugin directory, which differs per platform. */
-function pluginsDir() {
-  if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-    return join(local, "Roblox", "Plugins");
-  }
-  if (process.platform === "darwin") {
-    return join(homedir(), "Documents", "Roblox", "Plugins");
-  }
-  // Studio only ships for Windows and macOS; anything else is a Wine/Proton
-  // layout we cannot guess, so make the user point us at it.
-  throw new Error(
-    "Roblox Studio does not run natively on this platform. Build with " +
-      "`npm run build:plugin` and copy build/StudioMCP.rbxmx into your plugins folder.",
-  );
+const targets = pluginDirs();
+if (targets.length === 0) {
+  throw new Error(noPluginsDirMessage());
 }
 
 execFileSync(process.execPath, [join(root, "scripts", "build-plugin.mjs")], { stdio: "inherit" });
-
-const target = pluginsDir();
-if (!existsSync(target)) mkdirSync(target, { recursive: true });
 
 /*
  * Copied beside the target and renamed over it, never written in place.
@@ -51,12 +38,39 @@ if (!existsSync(target)) mkdirSync(target, { recursive: true });
  * Rename within one directory is atomic, so Studio sees the old file or the new
  * one and never the seam between them.
  */
-const destination = join(target, "StudioMCP.rbxmx");
-const staged = join(target, "StudioMCP.rbxmx.incoming");
-try {
-  copyFileSync(built, staged);
-  renameSync(staged, destination);
-} catch (cause) {
-  rmSync(staged, { force: true });
-  throw cause;
+function install(target) {
+  if (!existsSync(target)) mkdirSync(target, { recursive: true });
+  const destination = join(target, "StudioMCP.rbxmx");
+  const staged = join(target, "StudioMCP.rbxmx.incoming");
+  try {
+    copyFileSync(built, staged);
+    renameSync(staged, destination);
+  } catch (cause) {
+    rmSync(staged, { force: true });
+    throw cause;
+  }
+  // Read back rather than trusted: this is the step that used to fail silently.
+  if (!readFileSync(destination).equals(readFileSync(built))) {
+    throw new Error(`${destination} does not match the build that was just copied there.`);
+  }
+}
+
+const failed = [];
+for (const { dir, label } of targets) {
+  try {
+    install(dir);
+    process.stderr.write(`Installed StudioMCP.rbxmx -> ${dir}  [${label}]\n`);
+  } catch (cause) {
+    failed.push(dir);
+    process.stderr.write(`FAILED  ${dir}  [${label}]: ${cause instanceof Error ? cause.message : cause}\n`);
+  }
+}
+
+if (failed.length === targets.length) {
+  process.exitCode = 1;
+} else {
+  process.stderr.write(
+    "Now quit Roblox Studio completely and start it again. Focusing the window does not reload plugins.\n",
+  );
+  if (failed.length > 0) process.exitCode = 1;
 }

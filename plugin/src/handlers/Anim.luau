@@ -29,8 +29,24 @@ local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
 local Dispatch = require(script.Parent.Parent.Dispatch)
 local Paths = require(script.Parent.Parent.Paths)
 local Serialize = require(script.Parent.Parent.Serialize)
+local Undo = require(script.Parent.Parent.Undo)
 
 local Anim = {}
+
+--[[
+	How far the second keyframe sits from the first when an animation would
+	otherwise have no length.
+
+	A KeyframeSequence whose keyframes are all at time 0 has `Length == 0`, and a
+	track with no length cannot be previewed: `AnimationTrack.Length` never
+	becomes non-zero, so `preview` waits out its full deadline and reports
+	ANIMATION_TIMEOUT for an animation that loaded perfectly. Measured with a
+	one-keyframe pose: every preview timed out; the same pose as two keyframes a
+	tenth of a second apart previewed at once. A tenth is long enough to be
+	unambiguously non-zero and short enough that a held pose looks like a held
+	pose.
+]]
+local MIN_LENGTH = 0.1
 
 --[[
 	Keyframes returned in full detail before the listing thins out.
@@ -506,6 +522,9 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 
 	local rootName = if typeof(params.root) == "string" and params.root ~= "" then params.root else "HumanoidRootPart"
 	local count = 0
+	-- For the zero-length check after the loop.
+	local longest = 0
+	local lastKeyframe: Keyframe? = nil
 
 	-- Every joint the caller names, gathered before anything is built, because
 	-- the rig guess reads the whole set rather than one keyframe's worth.
@@ -537,6 +556,10 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 
 		local keyframe = Instance.new("Keyframe")
 		keyframe.Time = tonumber(frame.time) or 0
+		longest = math.max(longest, keyframe.Time)
+		if lastKeyframe == nil or keyframe.Time >= lastKeyframe.Time then
+			lastKeyframe = keyframe
+		end
 		if typeof(frame.name) == "string" and frame.name ~= "" then
 			keyframe.Name = frame.name
 		end
@@ -600,12 +623,58 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 		keyframe.Parent = sequence
 	end
 
+	--[[
+		Never left with zero length.
+
+		Every keyframe at time 0 -- which is what one keyframe always is -- gives a
+		sequence a `Length` of 0, and `preview` cannot seek a track like that: it
+		waits out its deadline and reports ANIMATION_TIMEOUT. The fix is a second
+		keyframe repeating the last one a moment later, which changes nothing about
+		the pose and gives the animation a duration.
+	]]
+	local padded = false
+	if longest <= 0 and lastKeyframe ~= nil then
+		local copy = (lastKeyframe :: Keyframe):Clone()
+		copy.Name = "Keyframe"
+		copy.Time = MIN_LENGTH
+		copy.Parent = sequence
+		padded = true
+	end
+
 	local ok, id = pcall(function()
 		return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
 	end)
-	-- Destroyed either way: registration copies what it needs, and the instance
-	-- was never in the data model to begin with.
-	sequence:Destroy()
+
+	--[[
+		Kept as a real instance when asked, destroyed otherwise.
+
+		The registered hash is good for `preview` and for nothing that ships: put
+		in an Animation that a real playtest loads, it takes the character's whole
+		Animator down (a full T-pose, not just this animation). What does work in a
+		game is a KeyframeSequence that exists as an instance -- parented in the
+		place, say under the Tool that plays it -- which the CLIENT registers for
+		itself at runtime. `parent` makes that instance here.
+	]]
+	local kept: string? = nil
+	local keepFailure: string? = nil
+	local keepsInstance = typeof(params.parent) == "string" and params.parent ~= ""
+	if ok and keepsInstance then
+		local okKeep, failure = pcall(function()
+			local container = Paths.resolve(params.parent)
+			Undo.record("StudioMCP.AnimBuild", "MCP build animation", function()
+				sequence.Parent = container
+			end)
+			kept = Paths.of(sequence)
+		end)
+		if not okKeep then
+			keepFailure = tostring(if typeof(failure) == "table" then (failure :: any).message else failure)
+		end
+	end
+	-- Registration copies what it needs, so a sequence that was not kept is
+	-- destroyed: it was never in the data model to begin with.
+	if kept == nil then
+		sequence:Destroy()
+	end
 
 	if not ok then
 		Dispatch.fail("ANIMATION_FAILED", string.format("Could not register the sequence: %s", tostring(id)))
@@ -613,9 +682,15 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 
 	return {
 		animationId = tostring(id),
-		keyframeCount = #(frames :: { any }),
+		keyframeCount = #(frames :: { any }) + (if padded then 1 else 0),
 		poseCount = count,
 		hierarchy = hierarchy,
+		-- Said so the caller is not surprised to find a keyframe they did not write.
+		paddedToTwoKeyframes = if padded then MIN_LENGTH else nil,
+		-- The instance to use in a real game, when `parent` was given.
+		instance = kept,
+		instanceNote = keepFailure,
+		scope = "preview-only",
 		-- Named, because a joint the rig does not have produces an animation that
 		-- plays perfectly and moves nothing -- the one failure here with no
 		-- symptom at all.
@@ -630,10 +705,65 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 			`GetKeyframeSequenceAsync`; the prefixed one fails both. So the shape
 			is correct and the instinct to correct it is the bug.
 		]]
-		note = "Use this id verbatim as an Animation's AnimationId -- do NOT put "
-			.. "rbxassetid:// or rbxasset:// in front of it, which stops it working. "
-			.. "It plays in this Studio session only: not uploaded, and gone on restart.",
+		note = "PREVIEW ONLY. Use this id verbatim with `animation op=preview`/`read` -- do "
+			.. "NOT put rbxassetid:// or rbxasset:// in front of it. It is valid only "
+			.. "in this Studio's edit session: NEVER write it to a real Animation.AnimationId "
+			.. "that a playtest loads -- LoadAnimation with it breaks the character's whole "
+			.. "Animator (full T-pose). For gameplay, pass `parent` to keep a real "
+			.. "KeyframeSequence in the place and register it on the client with "
+			.. "KeyframeSequenceProvider:RegisterKeyframeSequence()."
+			.. (if padded
+				then " A second keyframe was added " .. tostring(MIN_LENGTH) .. "s after the first because a zero-length animation cannot be previewed."
+				else ""),
 	}
+end
+
+--[[
+	A registered or downloaded animation with no length, re-registered with one.
+
+	`build` no longer produces these, but they still arrive: an id from an
+	older build, a hand-made KeyframeSequence, or an uploaded animation that
+	really is a single frame. All of them make `preview` time out, because a track
+	of length 0 cannot be seeked, and none of them is broken.
+
+	Returns the id of a copy with the last keyframe repeated MIN_LENGTH later, or
+	nil when the sequence cannot be read or is not actually zero-length -- in which
+	case the timeout has some other cause and padding would hide it.
+]]
+local function paddedCopy(id: string): string?
+	local okRead, sequence = pcall(function()
+		return KeyframeSequenceProvider:GetKeyframeSequenceAsync(id)
+	end)
+	if not okRead or sequence == nil then
+		return nil
+	end
+	local source = sequence :: KeyframeSequence
+
+	local last: Keyframe? = nil
+	local longest = 0
+	for _, frame in source:GetKeyframes() do
+		local keyframe = frame :: Keyframe
+		longest = math.max(longest, keyframe.Time)
+		if last == nil or keyframe.Time >= last.Time then
+			last = keyframe
+		end
+	end
+	if last == nil or longest > 0 then
+		source:Destroy()
+		return nil
+	end
+
+	local copy = last:Clone()
+	copy.Time = MIN_LENGTH
+	copy.Parent = source
+	local okRegister, newId = pcall(function()
+		return KeyframeSequenceProvider:RegisterKeyframeSequence(source)
+	end)
+	source:Destroy()
+	if not okRegister then
+		return nil
+	end
+	return tostring(newId)
 end
 
 --[[
@@ -790,6 +920,7 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 	end
 
 	local clip = track :: AnimationTrack
+	local padNote: string? = nil
 
 	--[[
 		Waited for, because a freshly loaded track has no length yet.
@@ -800,6 +931,37 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		two of a warm cache and takes noticeably longer on a cold one.
 	]]
 	local waited = 0
+	while clip.Length == 0 and waited < 1.5 do
+		waited += task.wait()
+	end
+
+	--[[
+		A length that has not arrived by now is usually a length that never will.
+
+		A sequence whose keyframes all sit at time 0 loads fine and reports
+		`Length == 0` forever, so waiting longer only delays the same timeout.
+		Checked directly: if that is what this is, a copy with a real duration is
+		previewed instead, and the reply says so.
+	]]
+	if clip.Length == 0 then
+		local padded = paddedCopy(id)
+		if padded ~= nil then
+			clip:Destroy()
+			animation.AnimationId = padded
+			local okAgain, again = pcall(function()
+				return (animator :: Animator):LoadAnimation(animation)
+			end)
+			if okAgain then
+				clip = again :: AnimationTrack
+				padNote = string.format(
+					"This animation has only one moment (length 0), which cannot be seeked, so a copy "
+						.. "with a second keyframe %gs later was previewed instead. The animation itself "
+						.. "is unchanged.",
+					MIN_LENGTH
+				)
+			end
+		end
+	end
 	while clip.Length == 0 and waited < 5 do
 		waited += task.wait()
 	end
@@ -808,7 +970,9 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		Dispatch.fail(
 			"ANIMATION_TIMEOUT",
 			string.format("%s did not load within 5s.", id),
-			"The animation must be public, or owned by the account signed into Studio."
+			"The animation must be public, or owned by the account signed into Studio. "
+				.. "A single-keyframe animation (length 0) is also handled, so a timeout here "
+				.. "usually means the asset could not be downloaded."
 		)
 	end
 
@@ -877,6 +1041,7 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		-- Reported because a weight of zero means the rig is NOT posed, however
 		-- healthy everything else in this reply looks.
 		weight = math.round(weight * 100) / 100,
+		padded = padNote,
 		note = if weight > 0
 			then "The rig is posed at this moment now -- take a `screenshot` to see it. "
 				.. 'Call again with a different `at` to compare, or op="stop" to clear it.'

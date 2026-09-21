@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 /**
  * Fingerprint of the Luau sources this server package ships.
  *
- * Roblox Studio only reloads a plugin when it next takes focus, so a developer
- * who rebuilds the plugin while working in a terminal keeps talking to the
- * previous build — and the symptom is a handler quietly behaving like an older
+ * Roblox Studio loads a plugin at startup and does not reliably reload it when
+ * the file changes (under Wine it never does), so a developer who rebuilds the
+ * plugin while working in a terminal keeps talking to the previous build — and the symptom is a handler quietly behaving like an older
  * version, which is miserable to debug. The plugin reports the fingerprint it
  * was built from, the server compares it against this one, and any mismatch is
  * surfaced in `studio_status` and `list_studios` with the fix.
@@ -94,9 +94,14 @@ export function pluginStalenessWarning(reported: string | undefined): string | n
   }
   return (
     `The connected Studio plugin was built from different sources than this ` +
-    `server (plugin ${reported}, server ${expected}). Studio only reloads a ` +
-    `plugin when its window next takes focus — click into Studio, then retry. ` +
-    `If that does not clear it, run \`npm run install:plugin\` and restart Studio.`
+    `server (plugin ${reported}, server ${expected}). Run ` +
+    `\`npx -y @el4cteo/rbx-studio-mcp --install-plugin\` (or \`npm run install:plugin\`), ` +
+    `then QUIT Studio completely and start it again — Studio loads plugins at ` +
+    `startup, and clicking into the window does not reload one.` +
+    (process.platform === "linux"
+      ? " On Linux the install writes to every Vinegar/Wine prefix it finds " +
+        "(native and Flatpak), because Studio may be running from either."
+      : "")
   );
 }
 
