@@ -26,6 +26,11 @@ local Dispatch = require(script.Parent.Parent.Dispatch)
 -- back, so the reply describes what happened rather than what was asked for.
 local SETTLE_SECONDS = 1.5
 
+-- How long a launch may sit unanswered, with Studio still in edit mode, before
+-- `stop` treats it as abandoned. Under Wine a real start takes 30-90s to enter
+-- play mode, so anything shorter would clear a launch that is merely slow.
+local STALE_PENDING_SECONDS = 120
+
 local Playtest = {}
 
 -- Supplied by the plugin entrypoint, which owns persistent plugin settings.
@@ -54,6 +59,9 @@ local pending = false
 local lastResult: any = nil
 local lastError: string? = nil
 local startedAt: number? = nil
+-- Which launch owns `pending`. A launch that was abandoned by `stop` and later
+-- returns must not clear the flag of the launch that replaced it.
+local generation = 0
 
 local function service(): any
 	return StudioTestService :: any
@@ -91,6 +99,8 @@ end
 	being raised into a caller that has already been answered.
 ]]
 local function launch(name: string, call: () -> any)
+	generation += 1
+	local mine = generation
 	pending = true
 	lastResult = nil
 	lastError = nil
@@ -102,6 +112,11 @@ local function launch(name: string, call: () -> any)
 			requireAllowed()
 			return call()
 		end)
+		-- Superseded: a newer launch owns the state now, and this one's outcome
+		-- describes a test nobody is waiting for any more.
+		if generation ~= mine then
+			return
+		end
 		pending = false
 		startedAt = nil
 		if ok then
@@ -168,17 +183,54 @@ function Playtest.control(params: { [string]: any }): { [string]: any }
 
 		task.wait(SETTLE_SECONDS)
 		local after = state()
+
+		--[[
+			A launch that never came back.
+
+			`pending` is cleared only when the Execute call returns, and under Wine
+			that call can simply never return: Studio is in edit mode, no playtest
+			session exists, and every later `play` is refused with ALREADY_RUNNING
+			for a test that is not there. Nothing else can clear it, so `stop` --
+			the call an agent reaches for at exactly this point -- does.
+
+			Deliberately conservative. A launch that is merely slow also looks like
+			this for the first minute or so, and clearing it then would let a second
+			start pile onto a transition that is still under way, which is what
+			wedges Studio. So it must be old, and Studio must be sitting in edit mode.
+		]]
+		local reaped = false
+		if
+			pending
+			and startedAt ~= nil
+			and os.clock() - startedAt >= STALE_PENDING_SECONDS
+			and not after.isRunning
+			and after.editModeActive ~= false
+		then
+			pending = false
+			startedAt = nil
+			after = state()
+			reaped = true
+		end
+
 		return {
-			changed = after.isRunning ~= before.isRunning or after.isEdit ~= before.isEdit,
+			changed = reaped or after.isRunning ~= before.isRunning or after.isEdit ~= before.isEdit,
+			reason = if reaped
+				then "Cleared a test start that never returned; Studio is in edit mode and nothing is running."
+				else nil,
 			state = after,
 		}
 	end
 
 	if pending then
+		local waited = if startedAt then math.floor(os.clock() - startedAt) else 0
 		Dispatch.fail(
 			"ALREADY_RUNNING",
-			"A test is already running.",
-			"Stop it first, or call with op 'state' to see how it is doing."
+			string.format("A test start has been pending for %ds.", waited),
+			if waited >= STALE_PENDING_SECONDS and not before.isRunning and before.editModeActive ~= false
+				then "Studio is in edit mode and no test is running, so the start never returned. "
+					.. "Call op 'stop' to clear it, then start again."
+				else "Under Wine a start can take 30-90s: poll op 'state' rather than sending it again. "
+					.. "Use op 'stop' to end it."
 		)
 	end
 

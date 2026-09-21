@@ -16,6 +16,7 @@ Fixes for running Studio under Wine/Vinegar on Linux, found while using the serv
 - `FailoverBridge.close()` now waits for a takeover already in progress, so a bridge closed while promoting no longer ends up holding the port with nothing to close it.
 - The panel's size-saving guard read an undeclared `unloading`, so it never guarded anything and a collapsing widget could overwrite the saved size. It is now declared and set when the plugin unloads.
 - `doctor` compares installed plugins with the hash of the plugin sources, as `studio_status` does, instead of `build/plugin-build-id.txt`, which is stale after a pull that has not been rebuilt.
+- `playtest`: a `play` whose start never returned left the plugin "pending" forever, so every later `play` was refused with ALREADY_RUNNING for a test that did not exist (and `list_studios` showed none). `stop` now clears a start that has been pending for 2+ minutes with Studio in edit mode, and the ALREADY_RUNNING error says how long it has been pending and whether to poll or `stop`. A launch that was cleared and returns late can no longer clear its replacement's state.
 - `check:plugin` (and so `build:plugin` and `npm test`) now fails on any name that is neither declared nor a Roblox global; this is how the two undeclared-variable bugs above went unnoticed.
 
 ### Added

@@ -83,7 +83,10 @@ export function registerPlaytestTools(context: ToolContext): void {
         "`force: true` is passed: it does not work reliably there and has crashed " +
         "Studio outright. Use `play` with one player instead. `play`/`stop` can also " +
         "sit in `testPending` for 30–90s on that setup — that is Studio being " +
-        "slow, not a failed call, so poll `state` rather than sending it again.\n\n" +
+        "slow, not a failed call, so poll `state` rather than sending it again. " +
+        "If `play` is refused with ALREADY_RUNNING although no playtest exists and " +
+        "the start has been pending for 2+ minutes, the start never returned: " +
+        "`stop` clears it.\n\n" +
         "Stopping discards everything the playtest changed, exactly as pressing " +
         "Stop does. Build in edit mode, then play — not the other way round.\n\n" +
         "The reply says whether the mode actually moved, not merely that Studio " +

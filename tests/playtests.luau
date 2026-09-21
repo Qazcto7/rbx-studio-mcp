@@ -46,4 +46,33 @@ assert(running)
 clientContext = true
 fresh.stopLocal()
 assert(left == 1 and not running, "client panel can stop without HTTP")
+
+-- A start that never returns: refused as ALREADY_RUNNING while young, and only
+-- `stop` clears it once it is old enough to be abandoned rather than slow.
+local wedged = loadModule(); setup(wedged); wedged.setAllowed(true)
+running, runMode, clientContext = false, false, false
+deferLaunch = true
+queued = {}
+wedged.control({op = "play"})
+assert(wedged.control({op = "state"}).state.testPending, "the start is pending")
+local okEarly, early = pcall(wedged.control, {op = "play"})
+assert(not okEarly and early.code == "ALREADY_RUNNING", "a second start is refused")
+assert(string.find(early.hint, "poll op 'state'", 1, true), "a young pending start says to poll")
+fakeNow += 60
+local young = wedged.control({op = "stop"})
+assert(young.state.testPending and not young.changed, "a 60s-old start is treated as slow, not stale")
+fakeNow += 70
+local okLate, late = pcall(wedged.control, {op = "play"})
+assert(not okLate and string.find(late.hint, "Call op 'stop'", 1, true), "an old pending start says stop clears it")
+local cleared = wedged.control({op = "stop"})
+assert(cleared.changed and not cleared.state.testPending, "stop clears a start that never returned")
+assert(string.find(cleared.reason, "never returned", 1, true))
+local launchesBefore = #launches
+wedged.control({op = "play"})
+assert(#queued == 2 and #launches == launchesBefore, "a new start is accepted (queued) after the clear")
+assert(wedged.control({op = "state"}).state.testPending, "and it is the new one that is pending")
+-- The abandoned launch returning late must not clear the new one's flag.
+queued[1]()
+assert(wedged.control({op = "state"}).state.testPending, "a superseded launch cannot clear the current one")
+deferLaunch = false
 print("playtests: defaults, persistence, guards, stop and queued-start lock pass")

@@ -1,4 +1,6 @@
 local stored = nil
+local fakeNow = 0
+local os = setmetatable({ clock = function() return fakeNow end }, { __index = os })
 local writes, launches, stopped, left, ended = 0, {}, 0, 0, 0
 local running, runMode, clientContext = false, false, false
 local queued = {}
