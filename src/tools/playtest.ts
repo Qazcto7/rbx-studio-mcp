@@ -257,14 +257,28 @@ export function registerPlaytestTools(context: ToolContext): void {
        * failing, just slow -- under Wine the transition can hold for a minute or
        * more and then complete on its own. Retrying `play` on top of it is what
        * makes it worse (ALREADY_RUNNING at best, a wedged Studio at worst).
+       *
+       * Past STALE_AFTER_SECONDS this stops being "probably slow": that is the
+       * same threshold Playtest.luau's `stop` uses to decide a launch never
+       * came back, so from here the honest advice changes from "wait" to "stop
+       * will actually clear this now" -- the two numbers must stay in sync.
        */
+      const STALE_AFTER_SECONDS = 120;
       const waited = response.state.runningForSeconds ?? 0;
-      if (response.state.testPending && !response.state.isRunning && waited >= 20) {
+      if (response.state.testPending && !response.state.isRunning && waited >= STALE_AFTER_SECONDS) {
+        notes.push(
+          `The test has been starting for ${waited}s without entering play mode — past the ` +
+            "point where this is merely slow. This now looks stuck, not slow: `stop` will " +
+            "recognize it as an abandoned launch and clear it (Studio is left in edit mode, " +
+            "nothing was running to lose). Do not send `play` again on top of it.",
+        );
+      } else if (response.state.testPending && !response.state.isRunning && waited >= 20) {
         notes.push(
           `The test has been starting for ${waited}s without entering play mode. ` +
             "Do not send `play` again; poll `state`" +
             (process.platform === "linux"
-              ? " — under Wine this can take 30–90s and usually resolves by itself. " +
+              ? ` — under Wine this can take 30–90s and usually resolves by itself; past ` +
+                `${STALE_AFTER_SECONDS}s, \`stop\` will treat it as abandoned instead. ` +
                 "If list_studios shows sessions as unreachable, wait a few minutes; " +
                 "restart Studio only if it never recovers."
               : "."),

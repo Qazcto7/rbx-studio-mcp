@@ -175,6 +175,38 @@ assert.ok(!stateResult.isError);
 context.bridge.call = normalCall;
 process.stdout.write("playtest lock errors and instruction precedence: ok\n");
 
+// Stuck-vs-slow: the note escalates once a pending launch passes the same
+// STALE_AFTER_SECONDS threshold Playtest.luau's `stop` uses to reap it, so the
+// advice ("wait" vs "stop will clear this now") matches what `stop` will
+// actually do if called.
+for (const [runningForSeconds, expectSlow, expectStuck] of [
+ [19, false, false],
+ [45, true, false],
+ [125, false, true],
+]) {
+ context.bridge.call = async () => ({
+  changed: false,
+  state: { testPending: true, isRunning: false, runningForSeconds },
+ });
+ const result = await playtest.handler(z.object(playtest.spec.inputSchema).parse({ op: "state" }));
+ assert.ok(!result.isError);
+ const text = result.content[0].text;
+ if (expectStuck) {
+  assert.match(text, /stuck, not slow/, `${runningForSeconds}s should read as stuck: ${text}`);
+  assert.match(text, /`stop` will recognize it as an abandoned launch/);
+ } else {
+  assert.doesNotMatch(text, /stuck, not slow/, `${runningForSeconds}s should not yet read as stuck: ${text}`);
+ }
+ if (expectSlow) {
+  assert.match(text, /starting for 45s/, `${runningForSeconds}s should get the slow-not-stuck note: ${text}`);
+ }
+ if (!expectSlow && !expectStuck) {
+  assert.doesNotMatch(text, /starting for/, `${runningForSeconds}s should get no note yet: ${text}`);
+ }
+}
+context.bridge.call = normalCall;
+process.stdout.write("playtest stuck-vs-slow escalation: ok\n");
+
 // OFF affects simulation starts, not the ordinary edit-mode tool paths.
 const { registerDiscoverTools } = await import("../dist/tools/discover.js");
 const { registerScriptTools } = await import("../dist/tools/scripts.js");

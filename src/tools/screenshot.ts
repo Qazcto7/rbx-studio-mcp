@@ -121,7 +121,16 @@ export function registerScreenshotTools(context: ToolContext): void {
         "actually looks like in front of the game. That one is taken on the client " +
         "and read back through the editor session, so it is a little slower and " +
         "needs the editor window still connected; the caption says `playtest " +
-        "client` when it came from there.",
+        "client` when it came from there.\n\n" +
+        "A playtest-client capture is that client's actual render, including " +
+        "effects that only exist on it: a script that sets " +
+        "`BasePart.LocalTransparencyModifier` to hide the local player's own " +
+        "character (common in third-person camera scripts) makes it invisible in " +
+        "this screenshot too, and a manually driven `CurrentCamera` (Scriptable " +
+        "CameraType) shows whatever that script is pointing it at right now, not " +
+        "a neutral default view. Neither is a capture bug — it is what that one " +
+        "player sees — but it means a shot that looks wrong or empty can be the " +
+        "game's own camera/visibility code, not a failed capture.",
       inputSchema: {
         width: z
           .number()
