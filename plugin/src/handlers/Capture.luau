@@ -120,8 +120,10 @@ local function isFlat(rgb: buffer): boolean
 end
 
 -- Only a content id comes back over the remote, so this is the time to start a
--- LocalScript and take one shot, not to move any pixels.
-local CLIENT_TIMEOUT = 25
+-- LocalScript and take the shot, not to move any pixels. Sized for two
+-- CAPTURE_TIMEOUT-length attempts (see CLIENT_SOURCE) plus the pause between
+-- them and the round trip itself, with headroom left over.
+local CLIENT_TIMEOUT = 30
 
 --[[
 	Screenshots during a playtest, taken by the client because only the client
@@ -150,8 +152,15 @@ local CLIENT_TIMEOUT = 25
 	at all -- which also removes the size ceiling that a client-side encode had
 	to stay under. See `Capture.playtestId` and `Capture.decode`; `screenshot`
 	in the MCP server drives both halves.
+
+	Retried once, the same as the editor-side capture below: under Wine a
+	callback that never fires is usually a one-off, and the retry -- not a
+	longer wait -- is what turns that into a screenshot instead of a
+	CAPTURE_TIMEOUT. `CLIENT_CAPTURE_TIMEOUT` is a placeholder substituted with
+	`CAPTURE_TIMEOUT` below rather than a literal, so the two capture paths
+	cannot drift out of sync the way the editor and client copies did before.
 ]]
-local CLIENT_SOURCE = [==[
+local CLIENT_SOURCE = ([==[
 local CaptureService = game:GetService("CaptureService")
 local RunService = game:GetService("RunService")
 
@@ -170,40 +179,64 @@ pcall(function()
 	RunService.PreRender:Wait()
 end)
 
-local contentId = nil
-local okShot, shotErr = pcall(function()
-	CaptureService:CaptureScreenshot(function(id)
-		contentId = id
+-- One try. Split out so a failure can be retried once instead of reported
+-- straight away, mirroring the editor-side attemptCapture in Capture.luau.
+local function attempt()
+	local contentId = nil
+	local okShot, shotErr = pcall(function()
+		CaptureService:CaptureScreenshot(function(id)
+			contentId = id
+		end)
 	end)
-end)
-if not okShot then
-	report:FireServer({ ok = false, reason = tostring(shotErr) })
-	return
+	if not okShot then
+		return nil, "refused: " .. tostring(shotErr)
+	end
+
+	local waited = 0
+	while contentId == nil and waited < CLIENT_CAPTURE_TIMEOUT do
+		task.wait(0.05)
+		waited += 0.05
+	end
+	if contentId == nil then
+		return nil, "no callback within " .. CLIENT_CAPTURE_TIMEOUT .. "s"
+	end
+
+	return contentId, nil
 end
 
-local waited = 0
-while contentId == nil and waited < 12 do
-	task.wait(0.05)
-	waited += 0.05
-end
+local contentId, failure = attempt()
 if contentId == nil then
-	report:FireServer({ ok = false, reason = "the client did not produce a screenshot within 12s" })
-	return
+	task.wait(0.2)
+	local retried, failure2 = attempt()
+	if retried ~= nil then
+		contentId = retried
+	else
+		-- Both failures are reported, not just the last -- see the equivalent
+		-- note in Capture.luau's takeScreenshot.
+		report:FireServer({
+			ok = false,
+			reason = "first attempt " .. tostring(failure) .. "; retry " .. tostring(failure2),
+		})
+		return
+	end
 end
 
 report:FireServer({ ok = true, contentId = contentId })
-]==]
+]==]):gsub("CLIENT_CAPTURE_TIMEOUT", tostring(CAPTURE_TIMEOUT))
 
 --[[
-	Takes the shot and waits for the id.
+	One try at `CaptureService:CaptureScreenshot`.
 
-	`CaptureService:CaptureScreenshot` answers through a callback rather than
-	yielding, so this bridges the two: the handler is already running on its own
-	task and is free to wait.
+	Returns the content id, or nil and a description of how it failed -- either
+	refused outright (the pcall itself threw) or the callback never fired.
+	Split out of `takeScreenshot` so a failure can be retried once instead of
+	reported straight away: measured under Wine, a callback that never fires is
+	usually a one-off, and calling `CaptureScreenshot` again a moment later
+	succeeds on the very next attempt. Reported to the agent as a captured
+	screenshot either way; only two failures in a row are worth surfacing.
 ]]
-local function takeScreenshot(): string
+local function attemptCapture(): (string?, string?)
 	local contentId: string? = nil
-	local failed: string? = nil
 
 	local ok, err = pcall(function()
 		CaptureService:CaptureScreenshot(function(id: string)
@@ -211,14 +244,7 @@ local function takeScreenshot(): string
 		end)
 	end)
 	if not ok then
-		failed = tostring(err)
-	end
-
-	if failed ~= nil then
-		Dispatch.fail(
-			"CAPTURE_REFUSED",
-			string.format("Studio refused to take a screenshot: %s", failed)
-		)
+		return nil, "refused: " .. tostring(err)
 	end
 
 	--[[
@@ -235,16 +261,41 @@ local function takeScreenshot(): string
 	while contentId == nil and waited < CAPTURE_TIMEOUT do
 		waited += if waited < 0.25 then task.wait() else task.wait(0.05)
 	end
-
 	if contentId == nil then
-		Dispatch.fail(
-			"CAPTURE_TIMEOUT",
-			string.format("Studio did not return a screenshot within %ds.", CAPTURE_TIMEOUT),
-			"The viewport may be hidden or Studio may be busy; try again."
-		)
+		return nil, string.format("no callback within %ds", CAPTURE_TIMEOUT)
 	end
 
-	return contentId :: any
+	return contentId, nil
+end
+
+local function takeScreenshot(): string
+	local contentId, failure = attemptCapture()
+	if contentId ~= nil then
+		return contentId
+	end
+
+	task.wait(0.2)
+	local retried, failure2 = attemptCapture()
+	if retried ~= nil then
+		return retried
+	end
+
+	--[[
+		Both attempts are reported, not just the last: a first refusal followed
+		by a second timeout (or the reverse) says something different than the
+		same failure twice, and the difference is lost the moment only one
+		survives to the error.
+	]]
+	local reason = string.format("first attempt %s; retry %s", tostring(failure), tostring(failure2))
+	if string.find(failure2 :: string, "^refused") then
+		Dispatch.fail("CAPTURE_REFUSED", string.format("Studio refused to take a screenshot twice: %s", reason))
+	end
+	Dispatch.fail(
+		"CAPTURE_TIMEOUT",
+		string.format("Studio did not return a screenshot after two tries: %s", reason),
+		"The viewport may be hidden or Studio may be busy; try again."
+	)
+	error("unreachable", 0) -- Dispatch.fail never returns; this satisfies the return type.
 end
 
 --[[
