@@ -589,6 +589,11 @@ local DESCRIBERS: { [string]: Describer } = {
 			then string.format("Pose %s at %.2fs", rig, at)
 			else "Pose " .. rig
 	end,
+	["anim.play"] = function(params)
+		local sequence = leaf(params.sequence) or "an animation"
+		local rig = leaf(params.rig)
+		return if rig ~= nil then string.format("Play %s on %s", sequence, rig) else "Play " .. sequence
+	end,
 
 	["data.list"] = function(params)
 		local store = params.store

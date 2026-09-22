@@ -65,6 +65,18 @@ local Instance = {
 		return make(class)
 	end,
 }
+-- Only `Anim.play`'s `prepare` callback reaches this: it clones Paths and
+-- Dispatch onto the relay the same way Exec.luau's client path clones its
+-- own dependencies. `make(...)` objects already have `:Clone()`, so no
+-- separate stand-in type is needed.
+local script = {
+	Parent = {
+		Parent = {
+			Paths = make("Paths"),
+			Dispatch = make("Dispatch"),
+		},
+	},
+}
 CFrame = { new = function() return "identity" end }
 Enum = { AnimationPriority = {} }
 
@@ -105,5 +117,32 @@ local Serialize = {
 local Undo = {
 	record = function(_, _, body)
 		return body(), true
+	end,
+}
+
+-- Records exactly what `Anim.play` hands the relay, the same way
+-- exec-client-stub.luau does for Exec.run's client path: `play` is not the
+-- subject here, what it is CALLED with is. The test sets `nextRelayAnswer`
+-- to script what the (fake) client reports back.
+local relayCalls = {}
+local nextRelayAnswer = nil
+local ClientRelay = {
+	playerFor = function(name)
+		return { Name = name or "Player1" }
+	end,
+	run = function(player, name, source, attributes, timeout, prepare)
+		local relay = make("LocalScript")
+		if prepare then
+			prepare(relay)
+		end
+		table.insert(relayCalls, {
+			player = player,
+			name = name,
+			source = source,
+			attributes = attributes,
+			timeout = timeout,
+			relay = relay,
+		})
+		return nextRelayAnswer or { ok = true, animationId = "session-hash", length = 1, looped = false, priority = "Action" }
 	end,
 }

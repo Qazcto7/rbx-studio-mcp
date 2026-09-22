@@ -83,9 +83,29 @@ function installedBuildId(file: string): string | null {
   }
 }
 
-async function checkPluginFiles(): Promise<Check[]> {
+/**
+ * Every installed copy, with the build id read off it (or null if it is
+ * missing or unreadable). Split out of `checkPluginFiles` so a connected
+ * Studio session's own `buildId` can be matched against these -- see
+ * `matchInstalls` -- without re-reading every file a second time.
+ */
+interface InstalledCopy {
+  dir: string;
+  label: string;
+  file: string;
+  id: string | null;
+}
+
+async function installedCopies(): Promise<InstalledCopy[]> {
   const dirs = await pluginDirs();
-  if (dirs.length === 0) {
+  return dirs.map(({ dir, label }) => {
+    const file = join(dir, "StudioMCP.rbxmx");
+    return { dir, label, file, id: existsSync(file) ? installedBuildId(file) : null };
+  });
+}
+
+function checkPluginFiles(copies: InstalledCopy[]): Check[] {
+  if (copies.length === 0) {
     return [
       {
         status: "warn",
@@ -98,18 +118,16 @@ async function checkPluginFiles(): Promise<Check[]> {
   }
 
   const expected = builtBuildId();
-  return dirs.map(({ dir, label }): Check => {
-    const file = join(dir, "StudioMCP.rbxmx");
-    const title = dirs.length > 1 ? `Studio plugin [${label}]` : "Studio plugin";
+  return copies.map(({ dir, label, file, id }): Check => {
+    const title = copies.length > 1 ? `Studio plugin [${label}]` : "Studio plugin";
     if (!existsSync(file)) {
       return {
-        status: dirs.length > 1 ? "warn" : "bad",
+        status: copies.length > 1 ? "warn" : "bad",
         title,
         detail: `Not installed. No file at ${file}.\n  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin`,
       };
     }
     const age = statSync(file).mtime.toISOString().slice(0, 16).replace("T", " ");
-    const id = installedBuildId(file);
     if (id === null) {
       return {
         status: "bad",
@@ -131,6 +149,33 @@ async function checkPluginFiles(): Promise<Check[]> {
     }
     return { status: "ok", title, detail: `Installed ${age} at ${file}` };
   });
+}
+
+/**
+ * Which installed copy (or copies) a connected session's build id matches.
+ *
+ * A running Studio cannot say which folder it loaded its plugin from -- Luau
+ * has no notion of its own file path -- so this is a match by build id, not
+ * proof. On one prefix that is exact; on a machine with several prefixes
+ * carrying the same (current) build, it narrows the field instead of naming
+ * one, which is still more than "no Studio is connected" leaves you with.
+ * This is the piece that used to be missing on a two-Vinegar-install machine:
+ * a buildId mismatch on the session told you *that* something was stale, not
+ * *which folder* to reinstall into.
+ */
+export function matchInstalls(buildId: string, copies: InstalledCopy[]): string {
+  const matches = copies.filter((copy) => copy.id === buildId);
+  if (matches.length === 0) {
+    return copies.length === 0
+      ? ""
+      : "\n  Loaded plugin matches none of the installed copies on this machine " +
+        "(all of them are a different build, or it was installed somewhere " +
+        "STUDIO_MCP_PLUGINS_DIR/the default search does not look).";
+  }
+  if (matches.length === 1) {
+    return `\n  Loaded from: ${matches[0]!.label} (${matches[0]!.dir})`;
+  }
+  return `\n  Loaded from one of: ${matches.map((copy) => copy.label).join(", ")} (same build id, cannot tell which)`;
 }
 
 /**
@@ -166,7 +211,7 @@ async function checkPort(port: number): Promise<Check> {
 }
 
 /** Asks the running bridge which Studios it can see, and whether they are current. */
-async function checkStudios(port: number, built: string | null): Promise<Check[]> {
+async function checkStudios(port: number, built: string | null, copies: InstalledCopy[]): Promise<Check[]> {
   let sessions: StudioSession[];
   try {
     const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
@@ -192,6 +237,11 @@ async function checkStudios(port: number, built: string | null): Promise<Check[]
     ];
   }
 
+  // Which folder(s) this actually is only matters when there is more than one
+  // to choose between -- on a single-prefix machine, "the plugin" already
+  // names it.
+  const locate = copies.length > 1;
+
   return sessions.map((session) => {
     // A plugin built from different sources answers with older handlers and no
     // other symptom, which is the hardest failure here to recognise from inside.
@@ -199,10 +249,12 @@ async function checkStudios(port: number, built: string | null): Promise<Check[]
     return {
       status: stale ? "warn" : "ok",
       title: `Studio: ${session.placeName}`,
-      detail: stale
-        ? `Plugin build ${session.buildId} does not match this package's ${built}.\n` +
-          "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio and start it again."
-        : `${session.context ?? "edit"}, over ${session.transport}, plugin ${session.pluginVersion}`,
+      detail:
+        (stale
+          ? `Plugin build ${session.buildId} does not match this package's ${built}.\n` +
+            "  Fix: npx -y @el4cteo/rbx-studio-mcp --install-plugin, then QUIT Studio and start it again."
+          : `${session.context ?? "edit"}, over ${session.transport}, plugin ${session.pluginVersion}`) +
+        (locate ? matchInstalls(session.buildId, copies) : ""),
     };
   });
 }
@@ -253,8 +305,9 @@ function checkLuau(): Check {
  */
 export async function collectChecks(port: number): Promise<Check[]> {
   const built = builtBuildId();
-  const checks: Check[] = [checkNode(), checkLuau(), ...(await checkPluginFiles()), await checkPort(port)];
-  checks.push(...(await checkStudios(port, built)));
+  const copies = await installedCopies();
+  const checks: Check[] = [checkNode(), checkLuau(), ...checkPluginFiles(copies), await checkPort(port)];
+  checks.push(...(await checkStudios(port, built, copies)));
   return checks;
 }
 

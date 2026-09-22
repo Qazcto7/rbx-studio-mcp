@@ -48,4 +48,39 @@ local keptSequence = registered[#registered].sequence
 assert(keptSequence.Parent ~= nil and not keptSequence.destroyed, "the kept sequence is parented, not destroyed")
 assert(registered[#registered - 1].sequence.destroyed, "an unkept sequence is destroyed")
 
+-- `play` needs a sequence path; nothing else is optional enough to guess.
+local okMissing, missingErr = pcall(Anim.play, {})
+assert(not okMissing and missingErr.code == "BAD_PARAMS", "play refuses without `sequence`")
+
+-- The common case: no `rig` given, so the relay is left to fall back to the
+-- local player's own character. Paths and Dispatch are cloned onto the relay
+-- for the embedded client script to require.
+local played = Anim.play({ sequence = "Workspace.Rig.Tool.MCPAnimation" })
+local call = relayCalls[#relayCalls]
+assert(call.name == "MCPAnimPlayRelay")
+assert(call.attributes.Sequence == "Workspace.Rig.Tool.MCPAnimation")
+assert(call.attributes.Rig == nil, "no rig means no Rig attribute at all -- the client falls back to the character")
+local clonedNames = {}
+for _, kid in call.relay:GetChildren() do
+	table.insert(clonedNames, kid.Name or kid.ClassName)
+end
+table.sort(clonedNames)
+assert(#clonedNames == 2, "Paths and Dispatch, nothing else, are cloned onto the relay")
+assert(played.played == true and played.animationId == "session-hash" and played.length == 1)
+
+-- A rig path, when given, becomes the Rig attribute verbatim.
+Anim.play({ sequence = "Workspace.Seq", rig = "Workspace.OtherRig" })
+call = relayCalls[#relayCalls]
+assert(call.attributes.Rig == "Workspace.OtherRig")
+
+-- The client refusing (no character, sequence not found, wrong class, no
+-- Humanoid/AnimationController...) surfaces as ANIMATION_PLAY_FAILED, not a
+-- raw client-side string the agent has no code to branch on.
+nextRelayAnswer = { ok = false, reason = "sequence not found: Workspace.Nope" }
+local okFail, failErr = pcall(Anim.play, { sequence = "Workspace.Nope" })
+nextRelayAnswer = nil
+assert(not okFail and failErr.code == "ANIMATION_PLAY_FAILED", "a client refusal becomes ANIMATION_PLAY_FAILED")
+assert(string.find(failErr.message, "sequence not found", 1, true), "the client's reason survives")
+
 print("anim build: padding, preview-only labelling and kept instances pass")
+print("anim play: relay wiring, rig fallback and failure mapping pass")

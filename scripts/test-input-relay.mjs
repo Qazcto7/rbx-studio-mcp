@@ -102,18 +102,30 @@ print(out.log .. "|" .. out.held .. "|" .. out.notes .. "|" .. out.performed .. 
 let outcome = run([{ kind: "click", x: 5, y: 5, button: "MouseButton1", action: "tap" }]);
 assert.equal(outcome.log, "MouseButton1 down,MouseButton1 up");
 assert.equal(outcome.held, "");
+assert.equal(outcome.notes, "", "nothing to clear, nothing to say");
 
-// A tap on a button already stuck down recovers instead of failing the step.
+// A relay that starts with a button already stuck down (left over from an
+// earlier call whose own cleanup never ran) clears it before its own plan
+// runs at all -- not just when a step happens to collide with it. The tap
+// that follows is then an ordinary press, not a mid-click recovery.
 outcome = run([{ kind: "click", x: 5, y: 5, button: "MouseButton1", action: "tap" }], { stuck: true });
 assert.equal(outcome.log, "MouseButton1 up,MouseButton1 down,MouseButton1 up");
 assert.equal(outcome.held, "");
-assert.match(outcome.notes, /recovered from a stuck press/);
+assert.match(outcome.notes, /MouseButton1 was left down from an earlier call/);
 assert.equal(outcome.performed, "click");
 
 // `release` releases and does NOT press first (it used to press, then release).
+// The stuck button is already gone by the time this step runs -- the release
+// it asks for was already done at start -- so the log has just the one entry.
 outcome = run([{ kind: "click", x: 5, y: 5, button: "MouseButton1", action: "release" }], { stuck: true });
 assert.equal(outcome.log, "MouseButton1 up");
 assert.equal(outcome.held, "");
+assert.match(outcome.notes, /MouseButton1 was left down from an earlier call/);
+
+// Nothing stuck at all: the proactive check finds every button already up and
+// says nothing about it.
+outcome = run([{ kind: "click", x: 5, y: 5, button: "MouseButton3", action: "tap" }]);
+assert.equal(outcome.notes, "", "no earlier button was down, so no note");
 
 // Releasing a button that is already up is the state that was asked for.
 outcome = run([{ kind: "click", x: 5, y: 5, button: "MouseButton2", action: "release" }]);
@@ -133,15 +145,29 @@ for (const button of ["MouseButton1", "MouseButton2", "MouseButton3"]) {
 outcome = run([{ kind: "click", x: 7, y: 9, button: "MouseButton2", action: "tap" }], { deliver: false });
 assert.equal(outcome.landed, "none", "an undelivered click reports no landing");
 
-// `release_all` clears a stuck button and reports each one.
+// `release_all` on a relay that starts stuck: the proactive check at start
+// already cleared it, so by the time this step runs every button reads
+// "already up" -- the clearing itself is reported once, in `notes`, rather
+// than through this step's per-button breakdown.
 outcome = run([{ kind: "release_all" }], { stuck: true });
 assert.equal(outcome.log, "MouseButton1 up");
 assert.equal(outcome.held, "");
-assert.equal(outcome.released, "MouseButton1:sent,MouseButton2:already up,MouseButton3:already up");
+assert.equal(outcome.released, "MouseButton1:already up,MouseButton2:already up,MouseButton3:already up");
+assert.match(outcome.notes, /MouseButton1 was left down from an earlier call/);
 
 // A held `press` survives the plan; it was asked to stay down.
 outcome = run([{ kind: "click", x: 1, y: 1, button: "MouseButton1", action: "press" }]);
 assert.equal(outcome.held, "MouseButton1");
+
+// A button stuck DURING this plan (a `press` with nothing to release it) is
+// not something the start-of-relay check could have known about -- it is
+// only stuck once the plan is already running -- so `release_all` still
+// finds and reports it the way it always did.
+outcome = run([
+  { kind: "click", x: 1, y: 1, button: "MouseButton1", action: "press" },
+  { kind: "release_all" },
+]);
+assert.equal(outcome.released, "MouseButton1:sent,MouseButton2:already up,MouseButton3:already up");
 
 // A key tap presses and releases.
 outcome = run([{ kind: "key", key: "W", action: "tap", hold: 0.01 }]);

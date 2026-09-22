@@ -61,9 +61,8 @@ export function registerAnimTools(context: ToolContext): void {
         "breaks the character's whole Animator (full T-pose, every animation " +
         "dead). For an animation that must run in the game, pass `parent` (e.g. " +
         "the Tool): `build` then leaves a real KeyframeSequence instance there, " +
-        "and the CLIENT registers it at runtime with " +
-        "`KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)`, which " +
-        "returns a session-local id that does work in a live game.\n\n" +
+        "and `play` loads and plays it on a running playtest's client in one " +
+        "call — no hand-written execute_luau needed.\n\n" +
         "Give `build` at least two keyframes at different times. A single " +
         "keyframe has zero length, and a zero-length animation cannot be " +
         "previewed (the preview times out). A single or all-at-time-0 animation is " +
@@ -79,12 +78,13 @@ export function registerAnimTools(context: ToolContext): void {
         "exactly as given — prefixing it stops it working. It is preview-only.",
       inputSchema: {
         op: z
-          .enum(["read", "preview", "build", "stop"])
+          .enum(["read", "preview", "build", "play", "stop"])
           .default("read")
           .describe(
             "'read' downloads an existing animation, 'preview' poses a rig at one " +
               "moment of it so you can screenshot it, 'build' makes a new one " +
-              "playable here, 'stop' clears a preview.",
+              "playable here, 'play' loads and plays a kept KeyframeSequence on a " +
+              "running playtest's client, 'stop' clears a preview.",
           ),
         assetId: z
           .union([z.number(), z.string()])
@@ -117,9 +117,9 @@ export function registerAnimTools(context: ToolContext): void {
           .describe(
             "build only: path to keep the built KeyframeSequence under as a real " +
               'instance (e.g. "Workspace.Rig.Tool" or "ServerStorage"). This is how ' +
-              "to make an animation that works in a real playtest: the client " +
-              "registers the instance itself with " +
-              "KeyframeSequenceProvider:RegisterKeyframeSequence. One undo step.",
+              "to make an animation that works in a real playtest: `play` (or the " +
+              "returned `instance`, for hand-written client code) loads and plays " +
+              "it there. One undo step.",
           ),
         root: z
           .string()
@@ -142,8 +142,27 @@ export function registerAnimTools(context: ToolContext): void {
               "`build` it is optional and is read for its joint layout — pass it for " +
               "anything that is not a standard R6 or R15 character (a custom rig, a " +
               "weapon, a door, a Blender import), or the poses may be attached in the " +
-              "wrong order and the animation will move nothing.",
+              "wrong order and the animation will move nothing. For `play`, it is " +
+              "optional and defaults to the player's own character.",
           ),
+        sequence: z
+          .string()
+          .optional()
+          .describe(
+            'play only: path to the KeyframeSequence instance to play, e.g. ' +
+              '"Workspace.Rig.Tool.MCPAnimation" — the `instance` a prior `build` ' +
+              "(called with `parent`) returned.",
+          ),
+        player: z
+          .string()
+          .optional()
+          .describe("play only: which player, by name. Omit for the only one in the playtest."),
+        fadeTime: z
+          .number()
+          .optional()
+          .describe("play only: blend-in time in seconds. Omit for the engine default."),
+        weight: z.number().optional().describe("play only: blend weight against other playing animations."),
+        speed: z.number().optional().describe("play only: playback speed multiplier. Omit for 1."),
         at: z
           .number()
           .min(0)
@@ -165,6 +184,28 @@ export function registerAnimTools(context: ToolContext): void {
       destructive: false,
     },
     async (args): Promise<ToolResult> => {
+      if (args.op === "play") {
+        if (!args.sequence) {
+          return text(
+            "play needs `sequence` — the path to a KeyframeSequence instance " +
+              "(the `instance` a prior `build`, called with `parent`, returned).",
+          );
+        }
+        const played = await bridge.call<Record<string, unknown>>(
+          "anim.play",
+          {
+            sequence: args.sequence,
+            rig: args.rig,
+            player: args.player,
+            fadeTime: args.fadeTime,
+            weight: args.weight,
+            speed: args.speed,
+          },
+          { studioId: args.studioId, timeoutMs: TIMEOUT_MS },
+        );
+        return json(played);
+      }
+
       if (args.op === "preview" || args.op === "stop") {
         if (!args.rig) return text("preview needs a `rig` — the model to pose.");
         const posed = await bridge.call<Record<string, unknown>>(
@@ -201,12 +242,10 @@ export function registerAnimTools(context: ToolContext): void {
             "that breaks the character's whole Animator (T-pose). Not uploaded, gone on " +
             "restart.\n\n" +
             (kept
-              ? `For the real game, the KeyframeSequence is kept at ${kept}. On the client:\n` +
-                "  local sequence = <that instance>\n" +
-                "  local anim = Instance.new(\"Animation\")\n" +
-                "  anim.AnimationId = game:GetService(\"KeyframeSequenceProvider\"):RegisterKeyframeSequence(sequence)\n" +
-                "  local track = humanoid.Animator:LoadAnimation(anim)\n" +
-                "Register it in the client VM, at runtime; the id is session-local.\n\n"
+              ? `For the real game, the KeyframeSequence is kept at ${kept}. During a ` +
+                `playtest, \`animation op="play" sequence="${kept}"\` loads and plays it ` +
+                "on the player's character (or pass `rig` for anything else) — no " +
+                "hand-written client code needed.\n\n"
               : "Pass `parent` to keep a real KeyframeSequence in the place for gameplay use.\n\n") +
             "`hierarchy` says which joint layout the poses were nested against — the " +
             "rig you named, or the R6/R15 standard guessed from the joint names. " +

@@ -423,6 +423,35 @@ local function sendButton(at, button, down)
 	return false, tostring(err2)
 end
 
+--[[
+	Released before this plan's own steps run, not just after one goes wrong.
+
+	`tapping` only knows what THIS relay pressed, and every relay starts that
+	table empty -- including one that follows a call whose own cleanup never
+	ran (Studio was force-closed, the process died, `Destroying` fired too
+	late to matter). The real input system does not forget, though: the
+	button is still down in it, and previously the first click of the new
+	call paid for that discovery -- one press-time "duplicate button state"
+	recovery per stuck button, with its own note about a press nobody asked
+	for.
+
+	Releasing all three up front costs nothing when nothing is stuck: asking
+	to release a button already up is exactly the "duplicate" `sendButton`
+	already turns into "already up". When one genuinely was held, this is the
+	transition that clears it -- silently as far as the input system is
+	concerned, so it is surfaced here, once, rather than left for whichever
+	step happens to hit it first.
+]]
+for _, name in { "MouseButton1", "MouseButton2", "MouseButton3" } do
+	local sent, how = sendButton(Vector2.new(0, 0), Enum.UserInputType[name], false)
+	if sent and how == "sent" then
+		table.insert(
+			notes,
+			string.format("%s was left down from an earlier call; released before this plan started.", name)
+		)
+	end
+end
+
 local function sendKey(code, down)
 	local ok, err = pcall(function()
 		virtual:SendKey(down, code, false)

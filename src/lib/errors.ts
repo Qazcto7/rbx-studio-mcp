@@ -73,6 +73,16 @@ export interface TimeoutState {
   /** Other calls still outstanding on the same session. */
   alsoInFlight: number;
   transport: "sse" | "poll";
+  /**
+   * A specific, high-confidence reason, when one is on hand: another call
+   * already in flight on this same session that is itself known to make
+   * Studio unresponsive for a while — a playtest starting or stopping.
+   *
+   * Distinct from the general "usually compiling, mid-playtest transition, or
+   * blocked on a modal" guess below: that is the honest ceiling when nothing
+   * more is known, and this is what replaces it when something is.
+   */
+  busyWith?: { description: string; forMs: number };
 }
 
 /**
@@ -104,13 +114,29 @@ export const TIMEOUT = (op: string, ms: number, state?: TimeoutState): ToolError
   ];
 
   // The two shapes point in opposite directions, so the advice does too.
-  const hint = state.delivered
+  let hint = state.delivered
     ? "Studio is usually compiling, mid-playtest transition, or blocked on a modal " +
       "dialog. It often clears on its own — retry once before treating it as broken. " +
       "If the work is genuinely long, run it through execute_luau in your own coroutine."
     : "The plugin has stopped collecting commands, which normally means Studio is " +
       "starting or stopping a playtest, or the window lost its connection. Call " +
       "list_studios to see which sessions are live, and address the call at one of them.";
+
+  // The busy guess above is replaced, not merely supplemented, when there is
+  // an actual answer on hand: another call on this same session, already
+  // known to make Studio unresponsive, that is itself still waiting.
+  if (state.busyWith) {
+    const waited = Math.round(state.busyWith.forMs / 1000);
+    facts.push(
+      `Studio is currently ${state.busyWith.description} (that call has been waiting ${waited}s) — ` +
+        "almost certainly why this one has not returned either.",
+    );
+    hint =
+      "This is not a hang to retry: it is Studio busy with a playtest transition it is " +
+      "already mid-way through. Do not resend this call. Poll `playtest` with " +
+      'op="state" instead, and only issue new requests once that settles (or call ' +
+      "op=\"stop\" if it has been stuck long enough to be offered as stale).";
+  }
 
   return new ToolError("TIMEOUT", `Studio did not answer "${op}" within ${ms}ms. ${facts.join(" ")}`, hint);
 };

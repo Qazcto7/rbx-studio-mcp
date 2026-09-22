@@ -31,7 +31,7 @@
     "build:plugin": "node scripts/check-plugin.mjs && node scripts/build-plugin.mjs",
     "sourcemap": "node scripts/sourcemap.mjs",
     "test:live": "node scripts/test-live.mjs",
-    "test": "node scripts/check-plugin.mjs && node scripts/test-plugin.mjs && node scripts/test-input-relay.mjs && node scripts/test-capture-relay.mjs && node scripts/test-plugin-dirs.mjs && node scripts/test-transport.mjs && node scripts/test-server.mjs && node scripts/test-bridge.mjs && node scripts/test-console.mjs && node scripts/test-failover.mjs && node scripts/test-tools.mjs",
+    "test": "node scripts/check-plugin.mjs && node scripts/test-plugin.mjs && node scripts/test-input-relay.mjs && node scripts/test-capture-relay.mjs && node scripts/test-anim-play-relay.mjs && node scripts/test-plugin-dirs.mjs && node scripts/test-transport.mjs && node scripts/test-server.mjs && node scripts/test-bridge.mjs && node scripts/test-console.mjs && node scripts/test-failover.mjs && node scripts/test-tools.mjs && node scripts/test-doctor.mjs",
     "build:all": "npm run build && npm run build:plugin",
     "install:plugin": "node scripts/install-plugin.mjs",
     "check:plugin": "node scripts/check-plugin.mjs",

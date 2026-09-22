@@ -26,6 +26,7 @@
 
 local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
 
+local ClientRelay = require(script.Parent.Parent.ClientRelay)
 local Dispatch = require(script.Parent.Parent.Dispatch)
 local Paths = require(script.Parent.Parent.Paths)
 local Serialize = require(script.Parent.Parent.Serialize)
@@ -719,6 +720,180 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 end
 
 --[[
+	Loads and plays a kept KeyframeSequence on a running playtest's client --
+	the four lines of client Luau the `build` reply used to hand back for the
+	agent to paste into `execute_luau target="client"` verbatim, now a call.
+
+	That hand-off was real friction, not just extra typing: `KeyframeSequenceProvider`
+	and `LoadAnimation` are both CLIENT-only, so shipping an animation that
+	actually plays in a playtest was the one workflow this server could describe
+	but not do -- every other tool acts directly, and this one made the agent be
+	its own client. Getting the boilerplate exactly right (find the sequence,
+	find the right Animator, register, load, play, and say what went wrong at
+	each step) is exactly the kind of thing worth not re-deriving per call.
+
+	Runs the same way `input` and the playtest screenshot do: a LocalScript
+	parented into the player's PlayerGui, because `KeyframeSequenceProvider` and
+	`Animator:LoadAnimation` both refuse outright when called from the server's
+	session -- "Instance is not accessible" -- and pcall does nothing about
+	that, only WRONG_CONTEXT would.
+]]
+local CLIENT_PLAY_SOURCE = [==[
+local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
+local Players = game:GetService("Players")
+
+local relay = script
+local report = relay:WaitForChild("Report", 10)
+if report == nil then
+	return
+end
+
+local Paths = require(script:WaitForChild("Paths"))
+
+-- Dispatch.fail (used inside Paths.resolve) raises a { code, message, hint }
+-- table, not a string; this is the one place on the client that has to know that.
+local function describe(err)
+	if typeof(err) == "table" and err.message ~= nil then
+		return tostring(err.message)
+	end
+	return tostring(err)
+end
+
+local sequencePath = relay:GetAttribute("Sequence")
+local rigPath = relay:GetAttribute("Rig")
+
+local okSequence, sequence = pcall(Paths.resolve, sequencePath)
+if not okSequence then
+	report:FireServer({ ok = false, reason = "sequence " .. describe(sequence) })
+	return
+end
+if not sequence:IsA("KeyframeSequence") then
+	report:FireServer({
+		ok = false,
+		reason = tostring(sequencePath) .. " is a " .. sequence.ClassName .. ", not a KeyframeSequence.",
+	})
+	return
+end
+
+local target
+if typeof(rigPath) == "string" and rigPath ~= "" then
+	local okRig, rig = pcall(Paths.resolve, rigPath)
+	if not okRig then
+		report:FireServer({ ok = false, reason = "rig " .. describe(rig) })
+		return
+	end
+	target = rig
+else
+	local character = Players.LocalPlayer.Character
+	if character == nil then
+		report:FireServer({
+			ok = false,
+			reason = "the local player has no character yet; wait for it to spawn, or pass `rig` to play on something else.",
+		})
+		return
+	end
+	target = character
+end
+
+local controller = target:FindFirstChildOfClass("Humanoid") or target:FindFirstChildOfClass("AnimationController")
+if controller == nil then
+	report:FireServer({
+		ok = false,
+		reason = target:GetFullName() .. " has no Humanoid or AnimationController to play an animation on.",
+	})
+	return
+end
+
+local animator = controller:FindFirstChildOfClass("Animator")
+if animator == nil then
+	-- Ordinary for a rig that has never played anything yet; games create this
+	-- the same way, on first use.
+	local okNew, made = pcall(Instance.new, "Animator")
+	if not okNew then
+		report:FireServer({ ok = false, reason = "could not create an Animator: " .. describe(made) })
+		return
+	end
+	made.Parent = controller
+	animator = made
+end
+
+local okId, id = pcall(function()
+	return KeyframeSequenceProvider:RegisterKeyframeSequence(sequence)
+end)
+if not okId then
+	report:FireServer({ ok = false, reason = "could not register the sequence: " .. describe(id) })
+	return
+end
+
+local anim = Instance.new("Animation")
+anim.AnimationId = id
+
+local okTrack, track = pcall(function()
+	return animator:LoadAnimation(anim)
+end)
+if not okTrack then
+	report:FireServer({ ok = false, reason = "could not load the animation: " .. describe(track) })
+	return
+end
+
+track:Play(relay:GetAttribute("FadeTime"), relay:GetAttribute("Weight"), relay:GetAttribute("Speed"))
+
+report:FireServer({
+	ok = true,
+	animationId = tostring(id),
+	length = track.Length,
+	looped = track.Looped,
+	priority = tostring(track.Priority),
+})
+]==]
+
+-- Long enough to cover a character that has not finished spawning yet.
+local PLAY_TIMEOUT = 20
+
+function Anim.play(params: { [string]: any }): { [string]: any }
+	if typeof(params.sequence) ~= "string" or params.sequence == "" then
+		Dispatch.fail(
+			"BAD_PARAMS",
+			"play needs `sequence` -- the path to a KeyframeSequence instance.",
+			'This is the `instance` a prior `build` (called with `parent`) returned, e.g. '
+				.. '"Workspace.Rig.Tool.MCPAnimation".'
+		)
+	end
+
+	local player = ClientRelay.playerFor(params.player)
+	local result = ClientRelay.run(player, "MCPAnimPlayRelay", CLIENT_PLAY_SOURCE, {
+		Sequence = params.sequence,
+		Rig = if typeof(params.rig) == "string" then params.rig else nil,
+		FadeTime = if typeof(params.fadeTime) == "number" then params.fadeTime else nil,
+		Weight = if typeof(params.weight) == "number" then params.weight else nil,
+		Speed = if typeof(params.speed) == "number" then params.speed else nil,
+	}, PLAY_TIMEOUT, function(relay)
+		-- Paths is the only dependency the client script itself requires, but
+		-- Paths in turn requires Dispatch (as a sibling, `script.Parent.Dispatch`)
+		-- for its own failure reporting, so both come along.
+		for _, name in { "Paths", "Dispatch" } do
+			local copy = script.Parent.Parent[name]:Clone()
+			copy.Parent = relay
+		end
+	end)
+
+	if result.ok ~= true then
+		Dispatch.fail("ANIMATION_PLAY_FAILED", tostring(result.reason or "the client refused to play it"))
+	end
+
+	return {
+		played = true,
+		player = player.Name,
+		-- Session-local, the same as `build`'s id: good for this playtest only,
+		-- and only useful here as the thing a later `op="stop"` can target.
+		animationId = result.animationId,
+		length = result.length,
+		looped = result.looped,
+		priority = result.priority,
+	}
+end
+
+--[[
 	A registered or downloaded animation with no length, re-registered with one.
 
 	`build` no longer produces these, but they still arrive: an id from an
@@ -1056,6 +1231,7 @@ function Anim.register()
 		read = Anim.read,
 		preview = Anim.preview,
 		build = Anim.build,
+		play = Anim.play,
 	})
 end
 

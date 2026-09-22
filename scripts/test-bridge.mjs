@@ -402,4 +402,72 @@ function twoStudios() {
  }
 }
 
+// A timeout on one call, while a playtest start/stop is already in flight on
+// the same session, names that call as the reason instead of guessing --
+// "usually compiling, mid-playtest transition, or blocked on a modal" is the
+// honest ceiling with nothing else known, and this is what replaces it when
+// something IS known.
+{
+  const bridge = new Bridge();
+  bridge.attach(identity("busy-test", 1), null);
+  try {
+    // Left pending on purpose -- nothing ever settles it, the same as a real
+    // playtest start Studio has not returned from yet.
+    void bridge.call("playtest.control", { op: "play" }, { clientId: "test", studioId: "busy-test" }).catch(() => {});
+
+    await assert.rejects(
+      bridge.call("execute_luau", {}, { clientId: "test", studioId: "busy-test", timeoutMs: 20 }),
+      (error) => {
+        assert.match(error.message, /Studio is currently starting a playtest/, "names the specific reason");
+        assert.match(error.message, /that call has been waiting \d+s/);
+        assert.match(error.hint, /Do not resend this call/);
+        assert.match(error.hint, /op="state"/);
+        return true;
+      },
+    );
+  } finally {
+    bridge.detach("busy-test");
+  }
+}
+
+// No busy call in flight: the generic guess stays, not a fabricated reason.
+{
+  const bridge = new Bridge();
+  bridge.attach(identity("idle-test", 1), null);
+  try {
+    await assert.rejects(
+      bridge.call("execute_luau", {}, { clientId: "test", studioId: "idle-test", timeoutMs: 20 }),
+      (error) => {
+        assert.doesNotMatch(error.message, /Studio is currently/);
+        assert.match(error.hint, /plugin has stopped collecting commands/);
+        return true;
+      },
+    );
+  } finally {
+    bridge.detach("idle-test");
+  }
+}
+
+// A pending `playtest.control op="state"` is a status poll, not a busy
+// signal -- it answers instantly under normal conditions and says nothing
+// about whether Studio is doing anything, so it must not be reported as the
+// reason for an unrelated call's timeout.
+{
+  const bridge = new Bridge();
+  bridge.attach(identity("state-only-test", 1), null);
+  try {
+    void bridge.call("playtest.control", { op: "state" }, { clientId: "test", studioId: "state-only-test" }).catch(() => {});
+
+    await assert.rejects(
+      bridge.call("execute_luau", {}, { clientId: "test", studioId: "state-only-test", timeoutMs: 20 }),
+      (error) => {
+        assert.doesNotMatch(error.message, /Studio is currently/);
+        return true;
+      },
+    );
+  } finally {
+    bridge.detach("state-only-test");
+  }
+}
+
 process.stdout.write("bridge: ok\n");

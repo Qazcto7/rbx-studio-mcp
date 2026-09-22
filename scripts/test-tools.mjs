@@ -239,9 +239,28 @@ process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
  const built = await anim.handler(z.object(anim.spec.inputSchema).parse({op:"build",parent:"Workspace.Rig.Tool",keyframes:[{time:0,poses:{"Right Arm":"0, 1, 0"}},{time:0.5}]}));
  assert.equal(seen.at(-1).params.parent, "Workspace.Rig.Tool");
  assert.match(built.content[0].text, /PREVIEW ONLY/);
- assert.match(built.content[0].text, /RegisterKeyframeSequence/);
+ assert.match(built.content[0].text, /op="play" sequence="Workspace\.Rig\.Tool\.MCPAnimation"/);
  assert.match(built.content[0].text, /Workspace\.Rig\.Tool\.MCPAnimation/);
  assert.match(anim.spec.description, /NEVER put a `build` id in the AnimationId/);
+
+ // `play` needs `sequence`, and passes rig/player/fadeTime/weight/speed through untouched.
+ const noSequence = await anim.handler(z.object(anim.spec.inputSchema).parse({op:"play"}));
+ assert.match(noSequence.content[0].text, /needs `sequence`/);
+
+ seen.length = 0;
+ animContext.bridge.call = async (op, params) => {
+  seen.push({op, params});
+  if (op === "anim.play") return {played:true, player:"Player1", animationId:"session-hash", length:2.5, looped:false, priority:"Action"};
+  throw new Error("unexpected " + op);
+ };
+ const played = await anim.handler(z.object(anim.spec.inputSchema).parse({
+  op:"play", sequence:"Workspace.Rig.Tool.MCPAnimation", rig:"Workspace.OtherRig", player:"P2", fadeTime:0.2, weight:1, speed:1.5,
+ }));
+ assert.deepEqual(seen.at(-1).params, {
+  sequence:"Workspace.Rig.Tool.MCPAnimation", rig:"Workspace.OtherRig", player:"P2", fadeTime:0.2, weight:1, speed:1.5,
+ });
+ assert.match(played.content[0].text, /"played": true/);
+ assert.match(played.content[0].text, /"animationId": "session-hash"/);
 
  // A bare hash written to AnimationId is called out (also when nested under
  // `children`); a real asset id and unrelated properties are not.

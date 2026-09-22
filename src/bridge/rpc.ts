@@ -65,6 +65,19 @@ interface Pending {
 }
 
 /**
+ * Sub-ops of `playtest.control` known to make Studio unresponsive for a
+ * while by themselves -- as opposed to `state`, which answers instantly and
+ * says nothing about whether Studio is busy.
+ */
+const BUSY_PLAYTEST_OPS: Record<string, string> = {
+  play: "starting a playtest",
+  run: "starting a playtest",
+  multiplayer: "starting a multiplayer playtest",
+  stop: "stopping a playtest",
+  endTest: "ending a playtest",
+};
+
+/**
  * How deep and how wide a params copy is kept for the peer announcement.
  *
  * The peer frame exists so another Studio window on the same place can name a
@@ -112,6 +125,28 @@ interface Session {
   /** A parked long-poll request, if one is currently waiting. */
   waiter: ((command: Command | null) => void) | null;
   pending: Map<string, Pending>;
+}
+
+/**
+ * Whether a playtest start/stop is already in flight on this session, and if
+ * so, for how long -- the piece that turns a timeout's "Studio is usually
+ * compiling, mid-playtest transition, or blocked on a modal" guess into a
+ * statement: another call on this exact session is already known to be the
+ * kind that makes Studio unresponsive, and it has not come back either.
+ *
+ * The oldest such call is reported when more than one somehow qualifies --
+ * that is the one that best explains how long Studio has been busy.
+ */
+function busyPlaytestControl(session: Session): { description: string; forMs: number } | undefined {
+  let oldest: Pending | undefined;
+  for (const pending of session.pending.values()) {
+    if (pending.op !== "playtest.control") continue;
+    const description = BUSY_PLAYTEST_OPS[String(pending.params.op)];
+    if (description === undefined) continue;
+    if (oldest === undefined || pending.startedAt < oldest.startedAt) oldest = pending;
+  }
+  if (oldest === undefined) return undefined;
+  return { description: BUSY_PLAYTEST_OPS[String(oldest.params.op)]!, forMs: Date.now() - oldest.startedAt };
 }
 
 /**
@@ -426,6 +461,7 @@ export class Bridge {
             silentForMs: Date.now() - session.lastSeenAt,
             alsoInFlight: session.pending.size,
             transport: session.stream ? "sse" : "poll",
+            busyWith: busyPlaytestControl(session),
           }),
         );
       }, timeoutMs);
