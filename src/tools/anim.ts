@@ -297,7 +297,10 @@ export function registerAnimTools(context: ToolContext): void {
             "rig you named, or the R6/R15 standard guessed from the joint names. " +
             "Anything in `unmatchedJoints` is a name that layout does not contain: " +
             "those poses were attached to the root and will almost certainly do " +
-            "nothing. Pass `rig` to fix it.",
+            "nothing. Pass `rig` to fix it. Anything in `unrootedJoints` is in the " +
+            "layout but its chain never reaches `root` (the pose everything hangs " +
+            "from, read from the rig when one is given) — pass `root` with the " +
+            "rig's real root part.",
         );
       }
 

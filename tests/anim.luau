@@ -110,5 +110,58 @@ local okStop, stopErr = pcall(Anim.stopPlay, {})
 nextRelayAnswer = nil
 assert(not okStop and stopErr.code == "ANIMATION_STOP_FAILED")
 
+-- The root pose comes from the rig when one is given. A Blender import's root
+-- is not called HumanoidRootPart, and nesting everything under a pose of that
+-- name made an animation that played and moved nothing.
+local function chainTo(joint)
+	local sequence = registered[#registered].sequence
+	local keyframe = sequence:GetKeyframes()[1]
+	local function find(pose, trail)
+		table.insert(trail, pose.Name)
+		if pose.Name == joint then
+			return table.concat(trail, "/")
+		end
+		for _, kid in pose:GetChildren() do
+			local hit = find(kid, table.clone(trail))
+			if hit then
+				return hit
+			end
+		end
+		return nil
+	end
+	return find(keyframe:GetChildren()[1], {})
+end
+local twoFrames = function(poses)
+	return { { time = 0, poses = poses }, { time = 0.5, poses = poses } }
+end
+
+defineRig("Workspace.Blender", { { "Root", "Hips" }, { "Hips", "Spine" }, { "Spine", "Arm" } })
+local blender = Anim.build({ rig = "Workspace.Blender", keyframes = twoFrames({ Arm = "0, 1, 0" }) })
+assert(blender.root == "Root", "the rig's own root part is used, got " .. tostring(blender.root))
+assert(chainTo("Arm") == "Root/Hips/Spine/Arm", "posed along the rig's real chain, got " .. tostring(chainTo("Arm")))
+assert(blender.unmatchedJoints == nil and blender.unrootedJoints == nil)
+
+-- An explicit `root` still wins.
+assert(Anim.build({ rig = "Workspace.Blender", root = "Hips", keyframes = twoFrames({ Arm = "0, 1, 0" }) }).root == "Hips")
+
+-- A character rig lands on HumanoidRootPart, exactly as before.
+defineRig("Workspace.R15", { { "HumanoidRootPart", "LowerTorso" }, { "LowerTorso", "UpperTorso" } })
+assert(Anim.build({ rig = "Workspace.R15", keyframes = twoFrames({ UpperTorso = "0, 1, 0" }) }).root == "HumanoidRootPart")
+
+-- Several roots (a `rig` holding two models): the PrimaryPart settles it, and
+-- a joint on the other model is reported as never reaching it.
+defineRig("Workspace.Pair", { { "A", "B" }, { "C", "D" } }, "C")
+local pair = Anim.build({ rig = "Workspace.Pair", keyframes = twoFrames({ B = "0, 1, 0", D = "0, 1, 0" }) })
+assert(pair.root == "C", "PrimaryPart settles several candidates, got " .. tostring(pair.root))
+assert(pair.unrootedJoints ~= nil and #pair.unrootedJoints == 1 and pair.unrootedJoints[1] == "B", "B's chain never reaches C")
+
+-- Joints that loop (same-named parts jointed both ways) no longer overflow
+-- the stack; the loop is reported instead.
+defineRig("Workspace.Loop", { { "X", "Y" }, { "Y", "X" }, { "Root", "Z" } })
+local okLoop, loop = pcall(Anim.build, { rig = "Workspace.Loop", keyframes = twoFrames({ X = "0, 1, 0", Y = "0, 1, 0", Z = "0, 1, 0" }) })
+assert(okLoop, "a joint loop is survived, got " .. tostring(if typeof(loop) == "table" then loop.message else loop))
+assert(loop.root == "Root")
+assert(loop.unrootedJoints ~= nil and #loop.unrootedJoints == 2, "both looping joints are reported")
+
 print("anim build: padding, preview-only labelling and kept instances pass")
 print("anim play: relay wiring, rig fallback and failure mapping pass")

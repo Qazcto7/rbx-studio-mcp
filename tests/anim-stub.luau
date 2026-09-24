@@ -98,8 +98,29 @@ local game = {
 	end,
 }
 
+-- Rigs a test registers by path: `joints` is a list of { part0, part1 } names,
+-- each a Motor6D in the model; `primary` names its PrimaryPart.
+local rigs = {}
+local function defineRig(path, joints, primary)
+	local motors = {}
+	for _, pair in joints do
+		table.insert(motors, {
+			IsA = function(_, class) return class == "Motor6D" end,
+			Part0 = { Name = pair[1] },
+			Part1 = { Name = pair[2] },
+		})
+	end
+	rigs[path] = {
+		GetDescendants = function() return motors end,
+		PrimaryPart = if primary then { Name = primary } else nil,
+	}
+end
+
 local Paths = {
-	resolve = function(_path)
+	resolve = function(path)
+		if rigs[path] ~= nil then
+			return rigs[path]
+		end
 		return make("Folder")
 	end,
 	of = function(instance)

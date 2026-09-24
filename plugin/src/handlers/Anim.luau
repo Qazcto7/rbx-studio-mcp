@@ -447,16 +447,23 @@ end
 	one of them appearing settles it; "Head" alone is ambiguous and falls to R6,
 	which is the older and likelier default for a hand-written animation.
 ]]
-local function parentMap(params: { [string]: any }, joints: { [string]: boolean }): ({ [string]: string }, string)
+local function parentMap(
+	params: { [string]: any },
+	joints: { [string]: boolean }
+): ({ [string]: string }, string, string?)
 	if typeof(params.rig) == "string" and params.rig ~= "" then
 		local model = Paths.resolve(params.rig)
 		local map: { [string]: string } = {}
+		local isChild: { [string]: boolean } = {}
+		local isParent: { [string]: boolean } = {}
 		local found = 0
 		for _, descendant in model:GetDescendants() do
 			if descendant:IsA("Motor6D") then
 				local zero, one = descendant.Part0, descendant.Part1
 				if zero ~= nil and one ~= nil then
 					map[one.Name] = zero.Name
+					isChild[one.Name] = true
+					isParent[zero.Name] = true
 					found += 1
 				end
 			end
@@ -468,7 +475,36 @@ local function parentMap(params: { [string]: any }, joints: { [string]: boolean 
 				"Point `rig` at the model whose parts the poses name."
 			)
 		end
-		return map, "rig"
+
+		--[[
+			The rig's own root: the part every chain hangs from, which moves
+			others and is moved by none. On a character that is HumanoidRootPart,
+			the old fixed default -- but a Blender import calls it "Root", a
+			weapon its handle, and nesting every pose under a "HumanoidRootPart"
+			pose those rigs do not have makes an animation that plays and moves
+			nothing. Several candidates (a `rig` holding more than one model)
+			settle on HumanoidRootPart or the PrimaryPart; nothing better known
+			leaves the default in place.
+		]]
+		local candidates: { string } = {}
+		for name in isParent do
+			if not isChild[name] then
+				table.insert(candidates, name)
+			end
+		end
+		table.sort(candidates)
+		local root: string? = nil
+		if table.find(candidates, "HumanoidRootPart") then
+			root = "HumanoidRootPart"
+		else
+			local primary = (model :: any).PrimaryPart
+			if primary ~= nil and table.find(candidates, primary.Name) then
+				root = primary.Name
+			elseif #candidates == 1 then
+				root = candidates[1]
+			end
+		end
+		return map, "rig", root
 	end
 
 	for joint in joints do
@@ -521,7 +557,6 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 		end
 	end
 
-	local rootName = if typeof(params.root) == "string" and params.root ~= "" then params.root else "HumanoidRootPart"
 	local count = 0
 	-- For the zero-length check after the loop.
 	local longest = 0
@@ -538,15 +573,33 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 		end
 	end
 
-	local parentOf, hierarchy = parentMap(params, joints)
+	local parentOf, hierarchy, rigRoot = parentMap(params, joints)
+	local rootName = if typeof(params.root) == "string" and params.root ~= ""
+		then params.root
+		else rigRoot or "HumanoidRootPart"
 
 	local unmatched: { string } = {}
+	-- Joints the layout knows, whose chain of parents still never reaches the
+	-- root: they end up nested under the wrong pose and, like unmatched ones,
+	-- move nothing. A cycle in the rig's joints lands here too.
+	local unrooted: { string } = {}
 	for joint in joints do
 		if joint ~= rootName and parentOf[joint] == nil then
 			table.insert(unmatched, joint)
+		elseif joint ~= rootName then
+			local seen: { [string]: boolean } = {}
+			local at: string? = joint
+			while at ~= nil and at ~= rootName and not seen[at] do
+				seen[at] = true
+				at = parentOf[at]
+			end
+			if at ~= rootName then
+				table.insert(unrooted, joint)
+			end
 		end
 	end
 	table.sort(unmatched)
+	table.sort(unrooted)
 
 	for position, entry in frames :: { any } do
 		if typeof(entry) ~= "table" then
@@ -582,6 +635,11 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 			its rest pose, quietly cancelling any movement the caller did ask for.
 		]]
 		local placed: { [string]: Pose } = {}
+		-- Joints whose parent chain is being placed right now. Meeting one again
+		-- means the rig's joints form a loop (two same-named parts jointed both
+		-- ways, a `rig` spanning several models); that link hangs off the root
+		-- instead of recursing until the stack runs out.
+		local placing: { [string]: boolean } = {}
 		local function poseFor(joint: string): Pose
 			if joint == rootName then
 				return root
@@ -595,9 +653,11 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 			pose.CFrame = CFrame.new()
 			pose.Weight = 0
 			local above = parentOf[joint]
+			placing[joint] = true
 			-- An unknown joint hangs off the root, which is what this did for
 			-- every joint before. It is reported rather than assumed correct.
-			pose.Parent = if above ~= nil and above ~= joint then poseFor(above) else root
+			pose.Parent = if above ~= nil and above ~= joint and not placing[above] then poseFor(above) else root
+			placing[joint] = nil
 			placed[joint] = pose
 			return pose
 		end
@@ -696,6 +756,9 @@ function Anim.build(params: { [string]: any }): { [string]: any }
 		-- plays perfectly and moves nothing -- the one failure here with no
 		-- symptom at all.
 		unmatchedJoints = if #unmatched > 0 then unmatched else nil,
+		unrootedJoints = if #unrooted > 0 then unrooted else nil,
+		-- The pose every other pose hangs from; taken from the rig when one is given.
+		root = rootName,
 		--[[
 			Used exactly as it comes back, with nothing added in front of it.
 
