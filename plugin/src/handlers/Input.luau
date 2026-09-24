@@ -499,16 +499,20 @@ if not hasReleaseAll then
 	end
 end
 
+-- Same contract as sendButton: `true, how` on success ("sent", "already up",
+-- "recovered from a stuck press"), `false, err` otherwise. It used to answer
+-- `true, nil` for both "sent" and "already up", so a `release_all` with a key
+-- always said the key had been held.
 local function sendKey(code, down)
 	local ok, err = pcall(function()
 		virtual:SendKey(down, code, false)
 	end)
 	if ok then
-		return true, nil
+		return true, "sent"
 	end
 	if isDuplicate(err) then
 		if not down then
-			return true, nil
+			return true, "already up"
 		end
 		pcall(function()
 			virtual:SendKey(false, code, false)
@@ -518,7 +522,7 @@ local function sendKey(code, down)
 			virtual:SendKey(true, code, false)
 		end)
 		if again then
-			return true, nil
+			return true, "recovered from a stuck press"
 		end
 		return false, err2
 	end
@@ -632,8 +636,8 @@ local function runStep(step): boolean
 			end
 		end
 		if step.key ~= nil then
-			local sent = sendKey(Enum.KeyCode[step.key], false)
-			released[step.key] = if sent then "sent" else "failed"
+			local sent, how = sendKey(Enum.KeyCode[step.key], false)
+			released[step.key] = if sent then how else ("failed: " .. tostring(how))
 		end
 		tapping.keys = {}
 		tapping.buttons = {}

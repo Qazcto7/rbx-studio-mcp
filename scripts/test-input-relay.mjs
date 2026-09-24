@@ -37,12 +37,13 @@ const lua = (value) =>
       ? `{${Object.entries(value).map(([key, item]) => `[${JSON.stringify(key)}]=${lua(item)}`).join(",")}}`
       : JSON.stringify(value);
 
-function run(plan, { stuck = false, stuckButtons = stuck ? ["MouseButton1"] : [], deliver = true, heldAttr = [], pressedApi = "accurate", lenientRelease = false } = {}) {
+function run(plan, { stuck = false, stuckButtons = stuck ? ["MouseButton1"] : [], deliver = true, heldAttr = [], pressedApi = "accurate", lenientRelease = false, keysDownAtStart = [], brokenButton = null } = {}) {
   const isStuck = (name) => stuckButtons.includes(name);
   const harness = `
 local log = {}
 local down = { MouseButton1 = ${isStuck("MouseButton1")}, MouseButton2 = ${isStuck("MouseButton2")}, MouseButton3 = ${isStuck("MouseButton3")} }
 local keysDown = {}
+for _, code in ${lua(keysDownAtStart.map((key) => "KeyCode." + key))} do keysDown[code] = true end
 local function mkEnum(prefix) return setmetatable({}, { __index = function(_, k) return prefix .. "." .. k end }) end
 Enum = { KeyCode = mkEnum("KeyCode"), UserInputType = mkEnum("UIT") }
 Color3 = { fromRGB = function() end }
@@ -55,6 +56,7 @@ local virtual = {
   end,
   SendMouseButton = function(_, at, button, isDown)
     local name = string.gsub(button, "UIT%.", "")
+    if name == ${JSON.stringify(brokenButton)} then error("input system unavailable") end
     -- Whether the engine throws on releasing a button that is already up is
     -- not known for certain; \`lenientRelease\` models an engine that accepts it.
     if down[name] == isDown then
@@ -188,6 +190,18 @@ assert.equal(outcome.released, "MouseButton1:sent,MouseButton2:already up,MouseB
 // A key tap presses and releases.
 outcome = run([{ kind: "key", key: "W", action: "tap", hold: 0.01 }]);
 assert.equal(outcome.log, "key true,key false");
+
+// release_all with a key reports the key the way it reports buttons: a key
+// that was up is "already up" (it used to say "sent" no matter what), a key
+// that was down is "sent".
+outcome = run([{ kind: "release_all", key: "W" }]);
+assert.match(outcome.released, /W:already up/);
+outcome = run([{ kind: "release_all", key: "W" }], { keysDownAtStart: ["W"] });
+assert.match(outcome.released, /W:sent/);
+// A button whose release throws something other than "duplicate" is reported
+// as a failure, not folded into "already up".
+outcome = run([{ kind: "release_all" }], { brokenButton: "MouseButton2" });
+assert.match(outcome.released, /MouseButton2:failed: [^,]*input system unavailable/);
 
 // --- Holds that span calls -------------------------------------------------
 

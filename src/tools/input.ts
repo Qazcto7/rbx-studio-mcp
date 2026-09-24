@@ -305,14 +305,23 @@ export function registerInputTools(context: ToolContext): void {
         const found = Object.entries(response.released)
           .map(([button, outcome]) => `${button}: ${outcome}`)
           .join(", ");
-        const held = Object.values(response.released).some((outcome) => outcome === "sent");
-        parts.push(
-          `Released — ${found}.` +
-            (held
-              ? " A release was actually sent for at least one button, so something " +
-                "had it held."
-              : " Every button was already up."),
-        );
+        /*
+         * Three answers, not two. Anything that is neither "sent" nor "already
+         * up" is a release that did not happen -- it used to fall through to
+         * "Every button was already up", which told the agent nothing was stuck
+         * exactly when a release had failed.
+         */
+        const outcomes = Object.entries(response.released);
+        const failed = outcomes.filter(([, outcome]) => outcome !== "sent" && outcome !== "already up");
+        const held = outcomes.some(([, outcome]) => outcome === "sent");
+        const verdict =
+          failed.length > 0
+            ? ` COULD NOT RELEASE ${failed.map(([button]) => button).join(", ")} — it may still be ` +
+              "held. Try `release_all` again; if it keeps failing, stop and restart the playtest."
+            : held
+              ? " A release was actually sent for at least one button, so something had it held."
+              : " Every button was already up.";
+        parts.push(`Released — ${found}.${verdict}`);
       }
       const note = parts.join(" ");
       return json(response, note);

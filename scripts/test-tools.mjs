@@ -92,6 +92,25 @@ process.stdout.write("client tool schemas: ok\n");
  assert.deepEqual(calls.at(-1).params.steps[0], withKey);
 }
 
+// The release_all verdict has three answers: a failure is never read as
+// "already up", and an "already up" key is not "something had it held".
+{
+ const saved = context.bridge.call;
+ const verdict = async (released) => {
+  context.bridge.call = async () => ({ delivered: true, steps: 1, player: "Player1", performed: ["release_all"], released });
+  const result = await input.handler(z.object(input.spec.inputSchema).parse({ steps: [{ kind: "release_all", key: "W" }] }));
+  return result.content[0].text;
+ };
+ const upAll = { MouseButton1: "already up", MouseButton2: "already up", MouseButton3: "already up", W: "already up" };
+ assert.match(await verdict(upAll), /Every button was already up/);
+ const failed = await verdict({ ...upAll, MouseButton2: "failed: input system unavailable" });
+ assert.match(failed, /COULD NOT RELEASE MouseButton2/);
+ assert.doesNotMatch(failed, /Every button was already up/);
+ assert.match(await verdict({ ...upAll, W: "sent" }), /something had it held/);
+ context.bridge.call = saved;
+}
+process.stdout.write("input release_all verdict: ok\n");
+
 // "The client read no pointer event" is for a press that went unread. A plan that
 // only releases has nothing to read, and a right click that was read reports where
 // it landed instead of being called a failure.
