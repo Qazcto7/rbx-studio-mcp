@@ -277,17 +277,30 @@ export function registerPlaytestTools(context: ToolContext): void {
        * same threshold Playtest.luau's `stop` uses to decide a launch never
        * came back, so from here the honest advice changes from "wait" to "stop
        * will actually clear this now" -- the two numbers must stay in sync.
+       *
+       * `testPending` is NOT "still starting": it stays true for the whole test,
+       * because ExecutePlayModeAsync only returns when the test ends, and the
+       * editor session's `isRunning` is false throughout a Play test too. So
+       * those two alone cannot tell a start that never came back from a
+       * healthy test that has simply been running for minutes -- and telling
+       * an agent to `stop` the latter kills a working test. `editModeActive`
+       * is what separates them (the plugin's own reaper uses it the same way):
+       * false means the test is running, so neither note applies. The "stuck"
+       * escalation also requires it to be positively true, not merely
+       * unreadable, since a wrong "stop it" costs far more than a missing one.
        */
       const STALE_AFTER_SECONDS = 120;
       const waited = response.state.runningForSeconds ?? 0;
-      if (response.state.testPending && !response.state.isRunning && waited >= STALE_AFTER_SECONDS) {
+      const editMode = response.state.editModeActive;
+      const startPending = response.state.testPending && !response.state.isRunning && editMode !== false;
+      if (startPending && editMode === true && waited >= STALE_AFTER_SECONDS) {
         notes.push(
           `The test has been starting for ${waited}s without entering play mode — past the ` +
             "point where this is merely slow. This now looks stuck, not slow: `stop` will " +
             "recognize it as an abandoned launch and clear it (Studio is left in edit mode, " +
             "nothing was running to lose). Do not send `play` again on top of it.",
         );
-      } else if (response.state.testPending && !response.state.isRunning && waited >= 20) {
+      } else if (startPending && waited >= 20) {
         notes.push(
           `The test has been starting for ${waited}s without entering play mode. ` +
             "Do not send `play` again; poll `state`" +

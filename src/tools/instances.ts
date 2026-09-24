@@ -283,7 +283,11 @@ function undoNote(response: MutationResponse): string {
  * included) instead of walking the schema, so it cannot fall behind it.
  */
 export function bareAnimationHashNote(request: unknown): string | undefined {
-  if (!/"AnimationId"\s*:\s*"[0-9a-fA-F]{32}"/.test(JSON.stringify(request))) return undefined;
+  // Plain `"AnimationId": "<hash>"` or the typed `{ "type": ..., "value": "<hash>" }`
+  // form, which a caller may send directly and which property typing produces.
+  if (!/"AnimationId"\s*:\s*(?:\{[^{}]*?"value"\s*:\s*)?"[0-9a-fA-F]{32}"/.test(JSON.stringify(request))) {
+    return undefined;
+  }
   return (
     "WARNING: that AnimationId is a bare hash from `animation op=\"build\"`, which is " +
     "valid ONLY for `animation op=\"preview\"` in this edit session. If a playtest loads " +
@@ -333,7 +337,9 @@ export function registerInstanceTools(context: ToolContext): void {
         { instances: specs },
         { studioId: args.studioId, timeoutMs: 30_000 },
       );
-      const hashNote = bareAnimationHashNote(specs);
+      // The raw request, not `specs`: typing has rewritten every property into
+      // `{ value, type }` by now, and this used to be checked against that.
+      const hashNote = bareAnimationHashNote(args.instances);
       return table(["path", "className"], response.items, {
         more: hashNote ? `${undoNote(response)}\n${hashNote}` : undoNote(response),
       });

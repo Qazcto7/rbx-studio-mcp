@@ -179,29 +179,41 @@ process.stdout.write("playtest lock errors and instruction precedence: ok\n");
 // STALE_AFTER_SECONDS threshold Playtest.luau's `stop` uses to reap it, so the
 // advice ("wait" vs "stop will clear this now") matches what `stop` will
 // actually do if called.
-for (const [runningForSeconds, expectSlow, expectStuck] of [
- [19, false, false],
- [45, true, false],
- [125, false, true],
+//
+// `testPending` stays true for the WHOLE test (ExecutePlayModeAsync returns
+// only when it ends) and the editor's `isRunning` is false throughout, so a
+// healthy test minutes in looks identical on those two fields to a start that
+// never came back. `editModeActive` is what separates them: false = running,
+// and then neither note may appear -- "stuck, call stop" there kills a
+// working test. "Stuck" also needs editModeActive positively true.
+for (const [runningForSeconds, editModeActive, expected] of [
+ [19, true, "none"],
+ [45, true, "slow"],
+ [125, true, "stuck"],
+ [45, false, "none"],   // a healthy test 45s in
+ [125, false, "none"],  // a healthy test 2+ minutes in: the regression
+ [600, false, "none"],
+ [125, undefined, "slow"], // unreadable: never escalate to "stop it"
 ]) {
  context.bridge.call = async () => ({
   changed: false,
-  state: { testPending: true, isRunning: false, runningForSeconds },
+  state: { testPending: true, isRunning: false, runningForSeconds, editModeActive },
  });
  const result = await playtest.handler(z.object(playtest.spec.inputSchema).parse({ op: "state" }));
  assert.ok(!result.isError);
  const text = result.content[0].text;
- if (expectStuck) {
-  assert.match(text, /stuck, not slow/, `${runningForSeconds}s should read as stuck: ${text}`);
+ const label = `${runningForSeconds}s, editModeActive=${editModeActive}`;
+ if (expected === "stuck") {
+  assert.match(text, /stuck, not slow/, `${label} should read as stuck: ${text}`);
   assert.match(text, /`stop` will recognize it as an abandoned launch/);
  } else {
-  assert.doesNotMatch(text, /stuck, not slow/, `${runningForSeconds}s should not yet read as stuck: ${text}`);
+  assert.doesNotMatch(text, /stuck, not slow/, `${label} must not read as stuck: ${text}`);
  }
- if (expectSlow) {
-  assert.match(text, /starting for 45s/, `${runningForSeconds}s should get the slow-not-stuck note: ${text}`);
+ if (expected === "slow") {
+  assert.match(text, new RegExp(`starting for ${runningForSeconds}s`), `${label} should get the slow note: ${text}`);
  }
- if (!expectSlow && !expectStuck) {
-  assert.doesNotMatch(text, /starting for/, `${runningForSeconds}s should get no note yet: ${text}`);
+ if (expected === "none") {
+  assert.doesNotMatch(text, /starting for/, `${label} should get no note: ${text}`);
  }
 }
 context.bridge.call = normalCall;
@@ -338,6 +350,39 @@ process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
  assert.equal(bareAnimationHashNote([{properties:{Name:hashed}}]), undefined);
 }
 process.stdout.write("animation: preview-only labelling and warnings ok\n");
+
+// The T-pose warning must fire through the real `create` handler, not just the
+// helper: by the time `create` checked, property typing had already rewritten
+// AnimationId into `{ value, type }`, which the old check never matched -- so
+// the warning was dead on exactly the path most likely to hit the trap.
+{
+ const { registerInstanceTools, bareAnimationHashNote } = await import("../dist/tools/instances.js");
+ const tools = new Map();
+ const sent = [];
+ registerInstanceTools({
+  server: { registerTool(name, spec, handler) { tools.set(name, { spec, handler }); } },
+  bridge: { async call(op, params) { sent.push({ op, params }); return { items: [{ path: "Workspace.Anim", className: "Animation" }], undoStep: "MCP create" }; } },
+ });
+ const create = tools.get("create");
+ const hashed = "0123456789abcdef0123456789abcdef";
+ for (const instances of [
+  [{ parent: "Workspace", className: "Animation", properties: { AnimationId: hashed } }],
+  [{ parent: "Workspace", className: "Tool", children: [{ className: "Animation", properties: { AnimationId: hashed } }] }],
+ ]) {
+  const result = await create.handler(z.object(create.spec.inputSchema).parse({ instances }));
+  assert.ok(!result.isError, JSON.stringify(result));
+  assert.match(result.content[0].text, /bare hash/, `create must warn: ${result.content[0].text}`);
+ }
+ // And the property really did reach Studio typed, which is what hid it.
+ assert.match(JSON.stringify(sent[0].params), /"AnimationId":\{"value":"0123456789abcdef0123456789abcdef"/);
+ // A caller may also send the typed form directly.
+ assert.match(bareAnimationHashNote([{ properties: { AnimationId: { type: "ContentId", value: hashed } } }]), /bare hash/);
+ const clean = await create.handler(z.object(create.spec.inputSchema).parse({
+  instances: [{ parent: "Workspace", className: "Animation", properties: { AnimationId: "rbxassetid://12345" } }],
+ }));
+ assert.doesNotMatch(clean.content[0].text, /bare hash/);
+}
+process.stdout.write("animation: create warns on a bare hash through the real handler ok\n");
 
 const { registerPerfTools } = await import("../dist/tools/perf.js");
 registerPerfTools(context);
