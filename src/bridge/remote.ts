@@ -82,6 +82,24 @@ export async function probeOwner(port: number): Promise<OwnerIdentity | null> {
 }
 
 /**
+ * Rebuilds the owner's refusal as a ToolError.
+ *
+ * Tool routes answer `{ ok: false, error: { code, message } }`, but the owner's
+ * catch-all answers a bad request with `{ error: "text" }` -- and reading that
+ * as the first shape produced a ToolError with an undefined code and message.
+ */
+function peerError(error: unknown): ToolError {
+  if (typeof error === "string") return new ToolError("PEER_ERROR", error);
+  if (error !== null && typeof error === "object") {
+    const { code, message } = error as { code?: unknown; message?: unknown };
+    if (typeof message === "string") {
+      return new ToolError(typeof code === "string" ? code : "PEER_ERROR", message);
+    }
+  }
+  return new ToolError("PEER_ERROR", "the bridge owner refused the request");
+}
+
+/**
  * A bridge that forwards everything to the process holding the port.
  *
  * There is no second connection to Studio and no second copy of the in-flight
@@ -185,7 +203,7 @@ export class RemoteBridge implements StudioBridge {
     // Preserve the 10-second margin beyond the owner's command deadline.
     const signal = AbortSignal.timeout(normalizeTimeoutMs(timeoutMs, 10_000));
     const encoded = JSON.stringify(body);
-    let payload: { ok: boolean; data?: T; error?: { code: string; message: string } };
+    let payload: { ok?: boolean; data?: T; error?: unknown };
     try {
       const response = await fetch(`${this.base}${path}`, {
         method: "POST",
@@ -200,10 +218,7 @@ export class RemoteBridge implements StudioBridge {
       throw this.unreachable(cause);
     }
 
-    if (!payload.ok) {
-      const error = payload.error ?? { code: "PEER_ERROR", message: "the bridge owner refused" };
-      throw new ToolError(error.code, error.message);
-    }
+    if (payload?.ok !== true) throw peerError(payload?.error);
     return payload.data as T;
   }
 
@@ -228,15 +243,19 @@ export class RemoteBridge implements StudioBridge {
   }
 
   async sessions(): Promise<SessionsView> {
+    let view: SessionsView;
     try {
       const response = await fetch(`${this.base}/sessions`, {
         headers: this.headers,
         signal: AbortSignal.timeout(5_000),
       });
-      return (await response.json()) as SessionsView;
+      view = (await response.json()) as SessionsView;
     } catch (cause) {
       throw this.unreachable(cause);
     }
+    // An error body read as a roster would crash the caller on `list.find`.
+    if (!Array.isArray(view?.list)) throw peerError((view as { error?: unknown })?.error);
+    return view;
   }
 
   async setActive(studioId: string): Promise<void> {

@@ -726,7 +726,9 @@ function whereIs(bin: string): string | null {
   const paths = (process.env["PATH"] ?? "").split(delimiter).filter((entry) => entry !== "");
   const extensions =
     process.platform === "win32"
-      ? (process.env["PATHEXT"] ?? ".EXE;.CMD;.BAT").split(";")
+      ? // Empty entries dropped: a trailing ";" would otherwise match npm's
+        // extensionless sh shim, which Windows cannot run.
+        (process.env["PATHEXT"] || ".EXE;.CMD;.BAT").split(";").filter((entry) => entry !== "")
       : [""];
   for (const dir of paths) {
     for (const extension of extensions) {
@@ -838,7 +840,12 @@ function kill(child: ChildProcess): void {
 
   if (process.platform === "win32") {
     try {
-      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+      // A spawn failure (taskkill missing, say) arrives as an `error` event, not
+      // a throw -- and an unhandled one would take this whole server down.
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }).on(
+        "error",
+        () => child.kill(),
+      );
       return;
     } catch {
       /* falls through to the plain kill */
@@ -972,9 +979,16 @@ export function run(
     while (cut !== -1) {
       const line = pending.slice(0, cut);
       pending = pending.slice(cut + 1);
-      const reading = harness.read(line);
-      if (reading.session !== undefined && reading.session !== "") session = reading.session;
-      for (const row of reading.lines) options.emit(row);
+      // A line an adapter did not expect must cost that line, not the process:
+      // this runs inside a stream handler, where a throw is uncaught and would
+      // take the bridge -- and every agent using it -- down with it.
+      try {
+        const reading = harness.read(line);
+        if (reading.session !== undefined && reading.session !== "") session = reading.session;
+        for (const row of reading.lines) options.emit(row);
+      } catch {
+        if (line.trim() !== "") options.emit({ level: "dim", message: line.slice(0, 400) });
+      }
       cut = pending.indexOf("\n");
     }
   };

@@ -6,6 +6,8 @@ What changed in each release, written for people using the server rather than fo
 
 Fixes for running Studio under Wine/Vinegar on Linux, found while using the server there day to day.
 
+This fork is merged with upstream 0.8.0 but **keeps the `animation` tool**, which upstream removed in 0.8.0 without a stated reason: `read`, `build`, `preview` and this fork's `play` are all still here.
+
 ### Fixed
 - **Stale plugin on Linux.** `--install-plugin` now finds Studio's plugins folder under Vinegar (native and Flatpak) and Wine prefixes and installs into every one it finds, instead of exiting on Linux. `STUDIO_MCP_PLUGINS_DIR` overrides the search. `doctor` checks each folder against this package's build id and flags a stale or truncated file.
 - The stale-plugin advice no longer says to click into the Studio window: that does not reload a plugin. It says to reinstall and quit Studio completely.
@@ -34,6 +36,48 @@ Fixes for running Studio under Wine/Vinegar on Linux, found while using the serv
 - `execute_luau target="client"` takes `settleSeconds`, which keeps the relay alive after the chunk returns so `task.spawn` threads can finish, and warns when code spawns threads without it.
 - `create`/`modify` warn when a bare-hash id from `animation op="build"` is written to an `AnimationId`: those ids are preview-only, and loading one in a playtest breaks the character's whole Animator.
 - `playtest op="multiplayer"` is refused on Linux unless `force: true` (or `STUDIO_MCP_ALLOW_MULTIPLAYER=1`); it is unreliable under Wine and has crashed Studio. A `play` that is slow to start now says to poll `state` rather than send it again.
+
+## 0.8.0
+
+### Added
+- `screenshot` can zoom: `path` (a GUI, part or model) or `rect`, at full resolution.
+- Colors can be written as hex, e.g. `"#FF8800"`.
+
+### Changed
+- `script_edit` and `script_create` are up to 50x faster.
+- Sharper screenshots (better downscaling).
+- Smaller tool replies (compact JSON), so agents use fewer tokens.
+- Faster first `create` / `modify` / `inspect`.
+- Removed the `animation` tool.
+- Dependencies updated.
+
+### Fixed
+- `create` works with Gemini / Vertex AI, and nested children are validated again.
+- `script_edit` no longer removes the script's final newline.
+- Instances named like `x[1]` can be found by path.
+- A 12-number `CFrame` gets the right rotation.
+- Client logs survive a player respawn.
+- Property checking recovers after a network error.
+- Missing arguments are reported as errors.
+- `api` and `inspect` no longer list deprecated or unusable members.
+- The server can no longer crash on odd output from a panel agent.
+## 0.7.8
+
+### Added
+- `console target="client"` reads continuously captured playtest client prints, warnings and errors, with player selection in multiplayer and stack/source details when available.
+- `console` returns `nextCursor`; passing it as `since` reads only newer matching output and reports any lines lost to buffer eviction or the response limit. Cursors are tied to one session and player.
+- `playtest op="play"` and `op="multiplayer"` return the connected playtest server `studioId` and available player names directly. If the server has not connected within the wait, the start still succeeds and explains how to find it later.
+
+## 0.7.7
+
+### Fixed
+- Studio's 30-minute reconnect no longer drops calls in flight or the chosen Studio.
+- Place name stays correct after a reconnect.
+- Calls no longer hang when a result can't be sent as JSON.
+- Long-poll no longer loses commands.
+- Big scripts reach Studio much faster.
+- Stopping an agent from the panel can't crash the server.
+- Small fixes: network timeouts, safer credentials save, clearer errors.
 
 ## 0.7.6
 

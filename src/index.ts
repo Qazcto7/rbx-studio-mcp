@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DEFAULT_PORT, startBridgeServer } from "./bridge/server.js";
 import { runDoctor } from "./doctor.js";
+import { loadApiDump } from "./lib/apidump.js";
 import type { ToolContext } from "./lib/tool.js";
 import { registerDiscoverTools } from "./tools/discover.js";
 import { registerInstanceTools } from "./tools/instances.js";
@@ -250,6 +251,10 @@ async function main(): Promise<void> {
       name: client?.name ?? "unknown",
       version: client?.version ?? "",
     });
+    // Loaded while the agent is still reading the tool list, so the first
+    // `create`, `modify` or `inspect` does not pay ~300ms (or a download) for it.
+    // After the handshake, so parsing it cannot delay the handshake itself.
+    setTimeout(() => void loadApiDump(), 250).unref();
   };
 
   // stdout belongs to the MCP transport from here on; nothing else may write to it.

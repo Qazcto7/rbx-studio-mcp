@@ -47,7 +47,7 @@ const calls = [];
 let nextInputReply = null;
 const context = {
   server: { registerTool(name, spec, handler) { registered.set(name, { spec, handler }); } },
-  bridge: { async call(op, params, options) {
+  bridge: { async sessions() { return {list:[]}; }, async call(op, params, options) {
     calls.push({op, params, options});
     return op === "exec.run" ? {ok:true,returned:["nil",{answer:42}],output:[],milliseconds:1} : (nextInputReply ?? {delivered:true,steps:1,player:"Alice"});
   } },
@@ -207,6 +207,38 @@ for (const [runningForSeconds, expectSlow, expectStuck] of [
 context.bridge.call = normalCall;
 process.stdout.write("playtest stuck-vs-slow escalation: ok\n");
 
+// A successful start includes the newly attached runtime session and player
+// names, using the same discovery path as stop. The editor ID is excluded.
+{
+ let started = false;
+ let operation = "play";
+ const originalSessions = context.bridge.sessions;
+ const originalCall = context.bridge.call;
+ context.bridge.sessions = async () => ({list: started
+   ? [{studioId:"editor",context:"edit"},{studioId:"runtime",context:"playtest server"}]
+   : [{studioId:"editor",context:"edit"}]});
+ context.bridge.call = async (op, params, options) => {
+  assert.equal(op, "playtest.control");
+  if (params.op === operation) {
+   started = true;
+   return {changed:true,state:{testPending:true,isRunning:false}};
+  }
+  assert.equal(options.studioId, "runtime");
+  return {changed:false,state:{players:operation === "multiplayer" ? [{name:"Alice",userId:123},{name:"Bob",userId:456}] : [{name:"Alice",userId:123}]}};
+ };
+ for (operation of ["play", "multiplayer"]) {
+  started = false;
+  const result = await playtest.handler(z.object(playtest.spec.inputSchema).parse({op:operation,studioId:"editor",
+    // The Linux/Wine multiplayer guard is this fork's; bypassed here on purpose.
+    ...(operation === "multiplayer" ? {force:true} : {})}));
+  assert.match(result.content[0].text, /"studioId": ?"runtime"/);
+  assert.match(result.content[0].text, /"name": ?"Alice"/);
+ }
+ context.bridge.sessions = originalSessions;
+ context.bridge.call = originalCall;
+}
+process.stdout.write("playtest runtime identity: ok\n");
+
 // OFF affects simulation starts, not the ordinary edit-mode tool paths.
 const { registerDiscoverTools } = await import("../dist/tools/discover.js");
 const { registerScriptTools } = await import("../dist/tools/scripts.js");
@@ -291,8 +323,8 @@ process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
  assert.deepEqual(seen.at(-1).params, {
   sequence:"Workspace.Rig.Tool.MCPAnimation", rig:"Workspace.OtherRig", player:"P2", fadeTime:0.2, weight:1, speed:1.5,
  });
- assert.match(played.content[0].text, /"played": true/);
- assert.match(played.content[0].text, /"animationId": "session-hash"/);
+ assert.match(played.content[0].text, /"played": ?true/);
+ assert.match(played.content[0].text, /"animationId": ?"session-hash"/);
 
  // A bare hash written to AnimationId is called out (also when nested under
  // `children`); a real asset id and unrelated properties are not.
@@ -306,3 +338,70 @@ process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
  assert.equal(bareAnimationHashNote([{properties:{Name:hashed}}]), undefined);
 }
 process.stdout.write("animation: preview-only labelling and warnings ok\n");
+
+const { registerPerfTools } = await import("../dist/tools/perf.js");
+registerPerfTools(context);
+const consoleTool = registered.get("console");
+const consoleArgs = z.object(consoleTool.spec.inputSchema).parse({target:"client",player:"Alice",studioId:"runtime",since:"cursor-1",limit:10});
+context.bridge.call = async (op, params, options) => {
+ assert.equal(op, "perf.console");
+ assert.equal(params.target, "client");
+ assert.equal(params.player, "Alice");
+ assert.equal(params.since, "cursor-1");
+ assert.equal(options.studioId, "runtime");
+ return {items:[],total:0,dropped:0,evicted:2,nextCursor:"cursor-2",capturing:true};
+};
+const consoleResult = await consoleTool.handler(consoleArgs);
+assert.match(consoleResult.content[0].text, /2 older lines were evicted/);
+assert.match(consoleResult.content[0].text, /nextCursor: cursor-2/);
+context.bridge.call = async () => ({
+ items: Array.from({length:60}, (_, index) => ({level:"print",message:`${index} ${"x".repeat(1000)}`})),
+ total:60,dropped:0,nextCursor:"cursor-3",
+});
+const boundedConsole = await consoleTool.handler(z.object(consoleTool.spec.inputSchema).parse({}));
+assert.ok(boundedConsole.content[0].text.length < 25_000);
+assert.match(boundedConsole.content[0].text, /older matching lines omitted/);
+process.stdout.write("client console schema and cursor forwarding: ok\n");
+
+// `create` must not advertise a recursive schema -- Gemini / Vertex AI reject a
+// `$ref` with HTTP 400 -- yet a bad nested child is still refused by name.
+{
+ const { registerInstanceTools } = await import("../dist/tools/instances.js");
+ const tools = new Map();
+ registerInstanceTools({ server: { registerTool(name, spec, handler) { tools.set(name, { spec, handler }); } }, bridge: { async call() { throw new Error("must not reach Studio"); } } });
+ const create = tools.get("create");
+ const schema = JSON.stringify(z.toJSONSchema(z.object(create.spec.inputSchema)));
+ assert.ok(!schema.includes("$ref") && !schema.includes("$defs") && !schema.includes("definitions"), "create schema is not recursive");
+ const bad = await create.handler(z.object(create.spec.inputSchema).parse({ instances: [{ parent: "Workspace", className: "Model", children: [{ className: "Part", children: [{ name: "NoClass" }] }] }] }));
+ assert.equal(bad.isError, true);
+ assert.match(bad.content[0].text, /BAD_PARAMS\] instances\[0\]\.children\[0\]\.children\[0\]\.className/);
+ process.stdout.write("create schema without recursion, nested validation: ok\n");
+}
+
+// Compact JSON: short structures on one line, and always parsed back identical.
+{
+ const { stringify } = await import("../dist/lib/format.js");
+ const value = { rows: [{ path: "Workspace.A", className: "Part" }], nested: { list: [1, "two", null, undefined], skip: undefined, when: new Date(0) }, long: "x".repeat(150) };
+ assert.deepEqual(JSON.parse(stringify(value)), JSON.parse(JSON.stringify(value)));
+ assert.match(stringify(value), /\n  "rows": \[\{"path":"Workspace.A","className":"Part"\}\],\n/, "a short row stays on one line");
+ assert.equal(stringify([]), "[]");
+ assert.equal(stringify(undefined), "null");
+ process.stdout.write("compact json: ok\n");
+}
+
+// Screenshot scaling: box filter averages everything under a pixel; enlarging copies blocks.
+{
+ const { boxResample, upscaleNearest } = await import("../dist/lib/png.js");
+ const stripes = Buffer.from([0,0,0, 200,200,200, 0,0,0, 200,200,200, 0,0,0, 200,200,200, 0,0,0, 200,200,200]);
+ assert.deepEqual([...boxResample(stripes, 4, 2, 2).rgb], [100,100,100, 100,100,100], "averages, never samples");
+ const W = 1661, H = 719, line = Buffer.alloc(W * H * 3);
+ for (let y = 0; y < H; y += 1) line[(y * W + 831) * 3] = 255;
+ const scaled = boxResample(line, W, H, 800);
+ assert.equal(scaled.width, 800);
+ assert.equal(scaled.height, 346);
+ let red = 0; for (let i = 0; i < scaled.rgb.length; i += 3) red = Math.max(red, scaled.rgb[i]);
+ assert.ok(red > 100, "a one-pixel line survives a 2x reduction");
+ assert.equal(boxResample(stripes, 4, 2, 8).width, 4, "never scales up");
+ assert.deepEqual([...upscaleNearest(Buffer.from([1,2,3,4,5,6]), 2, 1, 2).rgb], [1,2,3,1,2,3,4,5,6,4,5,6,1,2,3,1,2,3,4,5,6,4,5,6]);
+ process.stdout.write("screenshot scaling: ok\n");
+}
