@@ -1242,14 +1242,22 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 	animator = (host :: Instance):FindFirstChildWhichIsA("Animator")
 
 	if params.op == "stop" then
-		-- Nothing was ever played through an Animator that does not exist, and
-		-- making one just to find nothing on it would add an instance to the
-		-- place for no reason.
+		--[[
+			No Animator: nothing is playing, and making one just to find that out
+			would add an instance to the place. The joints are still reset, though
+			-- a preview's pose lives in the Motor6D transforms, and those outlive
+			the Animator when its creation is undone (Ctrl+Z) mid-preview.
+		]]
 		if animator == nil then
+			for _, descendant in model:GetDescendants() do
+				if descendant:IsA("Motor6D") then
+					(descendant :: Motor6D).Transform = CFrame.new()
+				end
+			end
 			return {
 				rig = Paths.of(model),
 				stopped = 0,
-				note = "Nothing to stop: this rig has no Animator, so nothing was previewed on it.",
+				note = "Nothing was playing (this rig has no Animator); its joints are reset to the rest pose.",
 			}
 		end
 		local stopped = 0

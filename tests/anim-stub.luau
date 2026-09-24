@@ -39,7 +39,10 @@ local function make(class)
 		return nil
 	end
 	function methods.GetDescendants()
-		return {}
+		return data.descendants or {}
+	end
+	function methods.IsA(class)
+		return data.ClassName == class
 	end
 	function methods.SetAttribute(name, value)
 		data.attributes = data.attributes or {}

@@ -180,9 +180,17 @@ end
 local hash = string.rep("b", 32)
 
 local bare = dummy("Workspace.Bare", false)
+-- A joint left posed (a preview whose Animator was then undone): stop still
+-- puts it back, even though there is no Animator to stop anything on.
+local posedJoint = Instance.new("Motor6D")
+posedJoint.Transform = "posed"
+local bareModel = bare.Parent
+bareModel.descendants = { posedJoint }
 local stoppedBare = Anim.preview({ op = "stop", rig = "Workspace.Bare" })
 assert(stoppedBare.stopped == 0)
 assert(bare:FindFirstChildWhichIsA("Animator") == nil, "stop makes no Animator just to find nothing")
+assert(posedJoint.Transform == "identity", "the joints are reset even with no Animator")
+bareModel.descendants = nil
 
 local okPreview, previewErr = pcall(Anim.preview, { rig = "Workspace.Bare", assetId = hash })
 assert(not okPreview and previewErr.code == "ANIMATION_TIMEOUT", "a track with no length times out")

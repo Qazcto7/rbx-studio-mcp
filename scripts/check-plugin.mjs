@@ -22,7 +22,7 @@
  * Usage: node scripts/check-plugin.mjs
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -152,8 +152,11 @@ for (const file of files) {
  * first, and reported against the line it really sits on.
  */
 const embedded = [];
+// Removed on the way out, whatever the result: one per run otherwise piles up.
+const embeddedDir = mkdtempSync(join(tmpdir(), "studio-mcp-embedded-"));
+process.on("exit", () => rmSync(embeddedDir, { recursive: true, force: true }));
 {
-  const dir = mkdtempSync(join(tmpdir(), "studio-mcp-embedded-"));
+  const dir = embeddedDir;
   for (const file of files) {
     const source = readFileSync(file, "utf8");
     const placeholders = [...source.matchAll(/:gsub\("([A-Z][A-Z0-9_]*)"/g)].map((m) => m[1]);
@@ -169,10 +172,36 @@ const embedded = [];
   }
 }
 
+/*
+ * No analyser means none of the checks above ran, and that used to pass in
+ * silence -- a clean result that checked nothing. Said out loud locally (a
+ * plain build still works without it), and a failure in CI, where a green
+ * run has to mean the checks happened.
+ */
+const unanalysed = [];
+if (analyser === null) {
+  const message = missingLuau("luau-analyze", "LUAU_ANALYZE");
+  if (process.env.CI) {
+    failures.push(`luau-analyze is required in CI; without it none of the static checks run.\n${message}`);
+  } else {
+    process.stderr.write(`warning: static checks SKIPPED (undeclared names, shadowing, relay analysis).\n${message}`);
+  }
+}
+
 if (analyser !== null) {
   const readAnalysis = (target, relabel) => {
     const result = spawnSync(analyser, [target], { encoding: "utf8" });
-    return `${result.stdout ?? ""}${result.stderr ?? ""}`
+    // An analyser that could not run prints nothing, which reads as "clean".
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    // luau-analyze exits 0 on a clean file and prints what it found otherwise,
+    // so a failure with nothing printed means it did not really run.
+    if (result.error || result.signal || (result.status !== 0 && output.trim() === "")) {
+      unanalysed.push(
+        `${target}: ${result.error?.message ?? (result.signal ? `killed by ${result.signal}` : `exited ${result.status} with no output`)}`,
+      );
+      return [];
+    }
+    return output
       .split("\n")
       .filter((line) => line.trim() !== "")
       .map((line) => relabel(line.trim()));
@@ -295,6 +324,11 @@ if (mistyped.length > 0) {
 `,
   );
 }
+if (unanalysed.length > 0) {
+  process.stderr.write(`\nThe analyser could not run on these, so they were not checked:\n${unanalysed.join("\n")}\n`);
+}
 process.exit(
-  failures.length > 0 || shadowed.length > 0 || mistyped.length > 0 || undeclared.length > 0 ? 1 : 0,
+  failures.length > 0 || shadowed.length > 0 || mistyped.length > 0 || undeclared.length > 0 || unanalysed.length > 0
+    ? 1
+    : 0,
 );

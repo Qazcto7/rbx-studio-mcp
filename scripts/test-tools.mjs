@@ -235,6 +235,21 @@ for (const [runningForSeconds, editModeActive, expected] of [
   assert.doesNotMatch(text, /starting for/, `${label} should get no note: ${text}`);
  }
 }
+// What the slow note says `stop` will do must match what the plugin will do:
+// it only reaps when edit mode is known, so with edit mode unreadable it must
+// not promise that. (The server's Wine wording is Linux-only.)
+if (process.platform === "linux") {
+ const noteFor = async (editModeActive) => {
+  context.bridge.call = async () => ({ changed: false, state: { testPending: true, isRunning: false, runningForSeconds: 125, editModeActive } });
+  return (await playtest.handler(z.object(playtest.spec.inputSchema).parse({ op: "state" }))).content[0].text;
+ };
+ const unreadable = await noteFor(undefined);
+ assert.doesNotMatch(unreadable, /`stop` will treat it as abandoned/, "no promise stop cannot keep");
+ assert.match(unreadable, /edit mode cannot be read here/);
+ context.bridge.call = async () => ({ changed: false, state: { testPending: true, isRunning: false, runningForSeconds: 45, editModeActive: true } });
+ const known = (await playtest.handler(z.object(playtest.spec.inputSchema).parse({ op: "state" }))).content[0].text;
+ assert.match(known, /past 120s, `stop` will treat it as abandoned/);
+}
 context.bridge.call = normalCall;
 process.stdout.write("playtest stuck-vs-slow escalation: ok\n");
 

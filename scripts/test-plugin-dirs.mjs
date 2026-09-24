@@ -133,6 +133,25 @@ assert.equal(unescapeRegString("\\101"), "A", "octal");
   assert.deepEqual(dirs(), [], "a redirect without Roblox in it is skipped, like an in-prefix folder");
 }
 
+// An ordinary prefix: Wine always writes the default, already-expanded path
+// under `Shell Folders`. That is the in-prefix profile folder, not a redirect,
+// and must keep its ordinary label rather than be reported as one.
+{
+  const machine = mkdtempSync(join(tmpdir(), "studio-mcp-plainwine-"));
+  const prefix = join(machine, ".wine");
+  mkdirSync(join(prefix, "drive_c", "users", "kazim", roblox), { recursive: true });
+  writeFileSync(
+    join(prefix, "user.reg"),
+    `WINE REGISTRY Version 2\n\n[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Explorer\\\\Shell Folders] 1712345678\n"Local AppData"="C:\\\\users\\\\kazim\\\\AppData\\\\Local"\n\n[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Explorer\\\\User Shell Folders] 1712345678\n"Local AppData"=str(2):"%USERPROFILE%\\\\AppData\\\\Local"\n`,
+  );
+  const listed = pluginDirs({ platform: "linux", env: {}, home: machine });
+  assert.deepEqual(
+    listed.map((e) => [e.dir, e.label]),
+    [[join(prefix, "drive_c", "users", "kazim", tail), "Wine default prefix (kazim)"]],
+    "the default Local AppData is the profile folder, labelled as such",
+  );
+}
+
 // One install reached by two routes -- the Flatpak data folder symlinked to the
 // native one -- is listed once, not twice.
 {

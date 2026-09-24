@@ -150,14 +150,24 @@ function registeredLocalAppData(prefix) {
  */
 function inPrefix(prefix, label) {
   const found = [];
+  const users = join(prefix, "drive_c", "users");
   const redirected = registeredLocalAppData(prefix);
   // Held to the same test as the in-prefix folders below: Studio has run there.
   // A prefix made for some other program can point Local AppData anywhere, and
   // installing would create Roblox/Plugins in it.
-  if (redirected !== null && existsSync(join(redirected, "Roblox"))) {
+  //
+  // And only a real redirect counts as one. Wine writes the default, already
+  // expanded, under `Shell Folders` in every prefix -- `C:\users\<you>\AppData\Local`,
+  // the profile folder listed below -- and reading that as a redirect relabelled
+  // every ordinary prefix "Local AppData redirect" in `doctor`.
+  const profileLocals = children(users).map((user) => canonical(join(users, user, "AppData", "Local")));
+  if (
+    redirected !== null &&
+    existsSync(join(redirected, "Roblox")) &&
+    !profileLocals.includes(canonical(redirected))
+  ) {
     found.push({ dir: join(redirected, "Roblox", "Plugins"), label: `${label}, Local AppData redirect` });
   }
-  const users = join(prefix, "drive_c", "users");
   for (const user of children(users)) {
     if (user === "Public") continue;
     const roblox = join(users, user, "AppData", "Local", "Roblox");

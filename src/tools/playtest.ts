@@ -301,12 +301,23 @@ export function registerPlaytestTools(context: ToolContext): void {
             "nothing was running to lose). Do not send `play` again on top of it.",
         );
       } else if (startPending && waited >= 20) {
+        /*
+         * What `stop` can do about it depends on edit mode being readable: the
+         * plugin only reaps a start when it knows Studio is in edit mode. With
+         * that unknown, promising "`stop` will clear it" would be false.
+         */
+        const wayOut =
+          editMode === true
+            ? `past ${STALE_AFTER_SECONDS}s, \`stop\` will treat it as abandoned instead. `
+            : waited >= STALE_AFTER_SECONDS
+              ? "Studio's edit mode cannot be read here, so `stop` will not clear this on its " +
+                "own; if it never resolves, restart Studio. "
+              : "";
         notes.push(
           `The test has been starting for ${waited}s without entering play mode. ` +
             "Do not send `play` again; poll `state`" +
             (process.platform === "linux"
-              ? ` — under Wine this can take 30–90s and usually resolves by itself; past ` +
-                `${STALE_AFTER_SECONDS}s, \`stop\` will treat it as abandoned instead. ` +
+              ? ` — under Wine this can take 30–90s and usually resolves by itself; ${wayOut}` +
                 "If list_studios shows sessions as unreachable, wait a few minutes; " +
                 "restart Studio only if it never recovers."
               : "."),
