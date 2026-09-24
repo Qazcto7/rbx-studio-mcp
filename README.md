@@ -1,6 +1,6 @@
 # Roblox Studio MCP
 
-Let an AI agent drive Roblox Studio: read your place, edit scripts, build geometry, run playtests, take screenshots. 34 tools. MIT.
+Let an AI agent drive Roblox Studio: read your place, edit scripts, build geometry, run playtests, take screenshots. 35 tools. MIT.
 
 ![The Studio MCP panel](docs/rbx-studio.png)
 

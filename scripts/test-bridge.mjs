@@ -462,6 +462,8 @@ function twoStudios() {
         assert.match(error.message, /Studio is currently starting a playtest/, "names the specific reason");
         assert.match(error.message, /that call has been waiting \d+s/);
         assert.match(error.hint, /Do not resend this call/);
+        // Never delivered: the lost-connection possibility is kept, after the busy reading.
+        assert.match(error.hint, /may have lost its connection/);
         assert.match(error.hint, /op="state"/);
         return true;
       },
@@ -546,6 +548,18 @@ function twoStudios() {
   bridge.attach({ ...identity("named", 1), placeName: "Place3" }, null);
   assert.equal(bridge.list()[0].placeName, "My Game", "reconnect keeps the published name");
   bridge.detach("named");
+}
+
+// Delivered and busy: Studio has the command, so a lost connection is not on
+// the table and the hint does not raise it.
+{
+  const { TIMEOUT } = await import("../dist/lib/errors.js");
+  const busyWith = { description: "starting a playtest", forMs: 45_000 };
+  const delivered = TIMEOUT("execute_luau", 20, { delivered: true, silentForMs: 1000, alsoInFlight: 1, transport: "sse", busyWith });
+  assert.match(delivered.hint, /Do not resend this call/);
+  assert.doesNotMatch(delivered.hint, /lost its connection/);
+  const queued = TIMEOUT("execute_luau", 20, { delivered: false, silentForMs: 1000, alsoInFlight: 1, transport: "poll", busyWith });
+  assert.match(queued.hint, /Do not resend this call.*may have lost its connection/s);
 }
 
 process.stdout.write("bridge: ok\n");

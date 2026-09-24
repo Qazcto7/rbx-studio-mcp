@@ -136,6 +136,15 @@ export const TIMEOUT = (op: string, ms: number, state?: TimeoutState): ToolError
       "already mid-way through. Do not resend this call. Poll `playtest` with " +
       'op="state" instead, and only issue new requests once that settles (or call ' +
       "op=\"stop\" if it has been stuck long enough to be offered as stale).";
+    // Never delivered is also what a window that lost its connection looks
+    // like -- and there a `state` poll gets stuck in the same queue. The busy
+    // reading stays the likelier one, so it leads; the other is not dropped.
+    if (!state.delivered) {
+      hint +=
+        " This command never even reached Studio, though, so if `list_studios` shows " +
+        "this session silent for minutes, the window may have lost its connection " +
+        "instead: address a live session, or restart Studio if none answers.";
+    }
   }
 
   return new ToolError("TIMEOUT", `Studio did not answer "${op}" within ${ms}ms. ${facts.join(" ")}`, hint);

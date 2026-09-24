@@ -41,7 +41,11 @@ execFileSync(process.execPath, [join(root, "scripts", "build-plugin.mjs")], { st
 function install(target) {
   if (!existsSync(target)) mkdirSync(target, { recursive: true });
   const destination = join(target, "StudioMCP.rbxmx");
-  const staged = join(target, "StudioMCP.rbxmx.incoming");
+  // Named per process: two installs running at once (a manual one alongside
+  // `doctor`, two terminals) would otherwise share one staging file and could
+  // rename each other's half-written copy into place. Still not a name Studio
+  // loads -- it ends in `.incoming`, not `.rbxmx`.
+  const staged = join(target, `StudioMCP.rbxmx.${process.pid}.incoming`);
   try {
     copyFileSync(built, staged);
     renameSync(staged, destination);

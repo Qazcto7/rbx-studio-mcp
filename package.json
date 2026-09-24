@@ -1,7 +1,7 @@
 {
   "name": "@el4cteo/rbx-studio-mcp",
   "version": "0.8.0",
-  "description": "MCP server for Roblox Studio. 34 tools, push-based SSE bridge, editor-safe script edits, one-step undo.",
+  "description": "MCP server for Roblox Studio. 35 tools, push-based SSE bridge, editor-safe script edits, one-step undo.",
   "type": "module",
   "license": "MIT",
   "bin": {
