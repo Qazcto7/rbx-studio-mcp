@@ -678,8 +678,8 @@ end
 
 for index, step in plan do
 	-- Guarded so one failing step can never stop the report going back.
-	local ok, done = pcall(runStep, step)
-	if not ok then
+	local stepOk, done = pcall(runStep, step)
+	if not stepOk then
 		-- A step that threw partway may have left a tap's button down.
 		releaseTransient()
 		table.insert(notes, string.format("step %d (%s) failed: %s", index - 1, tostring(step.kind), tostring(done)))

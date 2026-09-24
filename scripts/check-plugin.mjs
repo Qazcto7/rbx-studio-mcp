@@ -22,7 +22,8 @@
  * Usage: node scripts/check-plugin.mjs
  */
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { locateLuau, missingLuau } from "./locate-luau.mjs";
@@ -130,21 +131,84 @@ const analyser = locateLuau("LUAU_ANALYZE", ["luau-analyze.exe", "luau-analyze"]
 const shadowed = [];
 const mistyped = [];
 const undeclared = [];
-if (analyser !== null) {
+const unstrict = [];
+
+/*
+ * Every file is `--!strict`. That is what makes the analyser report a global
+ * that is assigned somewhere and read somewhere else as "Unknown global": in a
+ * non-strict file the same mistake is only the lint `GlobalUsedAsLocal`, or
+ * nothing at all when it is also read before it is written.
+ */
+for (const file of files) {
+  if (!readFileSync(file, "utf8").startsWith("--!strict")) unstrict.push(file);
+}
+
+/*
+ * The client relays are Luau too, but they live inside `[==[ ... ]==]` strings
+ * -- Input, Capture, animation play, the exec and debug relays -- so the
+ * analyser never saw a line of them, and a typo in a branch their own tests do
+ * not drive would ship. Each is written out and analysed on its own, with
+ * placeholders its host file substitutes by `:gsub("NAME", ...)` filled in
+ * first, and reported against the line it really sits on.
+ */
+const embedded = [];
+{
+  const dir = mkdtempSync(join(tmpdir(), "studio-mcp-embedded-"));
   for (const file of files) {
-    const result = spawnSync(analyser, [file], { encoding: "utf8" });
-    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-    for (const line of output.split("\n")) {
+    const source = readFileSync(file, "utf8");
+    const placeholders = [...source.matchAll(/:gsub\("([A-Z][A-Z0-9_]*)"/g)].map((m) => m[1]);
+    for (const block of source.matchAll(/\[(=+)\[([\s\S]*?)\]\1\]/g)) {
+      let body = block[2];
+      if (!/\bscript\b|game:GetService/.test(body)) continue;
+      for (const name of placeholders) body = body.replaceAll(name, "0");
+      const firstLine = source.slice(0, block.index).split("\n").length;
+      const path = join(dir, `${embedded.length}.luau`);
+      writeFileSync(path, body);
+      embedded.push({ path, file, firstLine });
+    }
+  }
+}
+
+if (analyser !== null) {
+  const readAnalysis = (target, relabel) => {
+    const result = spawnSync(analyser, [target], { encoding: "utf8" });
+    return `${result.stdout ?? ""}${result.stderr ?? ""}`
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => relabel(line.trim()));
+  };
+  const collectUndeclared = (line) => {
+    const unknown = line.match(/Unknown global '([^']+)'/);
+    if (unknown !== null) {
+      if (!ENGINE_GLOBALS.has(unknown[1])) undeclared.push(line);
+      return true;
+    }
+    // The non-strict spelling of the same mistake.
+    if (line.includes("GlobalUsedAsLocal:")) {
+      undeclared.push(line);
+      return true;
+    }
+    return false;
+  };
+
+  for (const file of files) {
+    for (const line of readAnalysis(file, (line) => line)) {
       if (line.includes("LocalShadow:")) {
-        shadowed.push(line.trim());
+        shadowed.push(line);
         continue;
       }
-      const unknown = line.match(/Unknown global '([^']+)'/);
-      if (unknown !== null) {
-        if (!ENGINE_GLOBALS.has(unknown[1])) undeclared.push(line.trim());
-        continue;
-      }
-      if (TYPE_PATTERNS.some((pattern) => pattern.test(line))) mistyped.push(line.trim());
+      if (collectUndeclared(line)) continue;
+      if (TYPE_PATTERNS.some((pattern) => pattern.test(line))) mistyped.push(line);
+    }
+  }
+  // Only names are checked in the relays: they run at script identity on a
+  // client, with none of the plugin's typing, so type findings there are noise.
+  for (const { path, file, firstLine } of embedded) {
+    const relabel = (line) =>
+      line.replace(/^[^(]*\((\d+),(\d+)\)/, (_, row, col) => `${file}(${firstLine + Number(row) - 1},${col}) [embedded relay]`);
+    for (const line of readAnalysis(path, relabel)) {
+      if (line.includes("LocalShadow:")) shadowed.push(line);
+      else collectUndeclared(line);
     }
   }
 }
@@ -193,6 +257,14 @@ if (kindless.size > 0) {
     "These operation groups have no entry in Phrase KINDS, so they are announced " +
       'as "read" whatever they do:\n  ' +
       [...kindless].sort().join("\n  "),
+  );
+}
+
+if (unstrict.length > 0) {
+  failures.push(
+    "These plugin files are not `--!strict` (it must be the first line). Without " +
+      "it the analyser stops reporting a mistyped global as unknown:\n  " +
+      unstrict.join("\n  "),
   );
 }
 
