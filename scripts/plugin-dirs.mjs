@@ -22,9 +22,9 @@
  *
  * Nothing here has side effects; callers decide what to do with the list.
  */
-import { existsSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 
 /** Relative path from a Wine `users/<name>` directory to the plugins folder. */
 const PLUGINS_UNDER_USER = join("AppData", "Local", "Roblox", "Plugins");
@@ -56,6 +56,41 @@ function children(dir) {
  * Only an absolute drive-letter path is trusted. Anything with `%VAR%` in it
  * needs Wine to expand it, and guessing wrong is worse than using the default.
  */
+/**
+ * A string value from a Wine .reg file, unescaped the way Wine reads it back.
+ *
+ * Wine writes every character above 127 as `\x` and hex (`\x00e2` for "â",
+ * `\x131` for "ı" -- up to four digits), control characters as `\n`, `\t`,
+ * ... or octal, and `\\` / `\"` for backslash and quote. Treating every
+ * escape as "the next character, literally" turned `K\x00e2z\x0131m` into
+ * `Kx00e2zx0131m`: a home folder with any non-ASCII letter lost the redirect.
+ */
+const CONTROL_ESCAPES = { a: "\x07", b: "\b", e: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v" };
+export function unescapeRegString(raw) {
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const char = raw[i];
+    if (char !== "\\" || i + 1 >= raw.length) {
+      out += char;
+      continue;
+    }
+    const next = raw[i + 1];
+    const hex = next === "x" ? /^[0-9a-fA-F]{1,4}/.exec(raw.slice(i + 2)) : null;
+    const octal = /^[0-7]{1,3}/.exec(raw.slice(i + 1));
+    if (hex) {
+      out += String.fromCharCode(parseInt(hex[0], 16));
+      i += 1 + hex[0].length;
+    } else if (octal) {
+      out += String.fromCharCode(parseInt(octal[0], 8));
+      i += octal[0].length;
+    } else {
+      out += CONTROL_ESCAPES[next] ?? next;
+      i += 1;
+    }
+  }
+  return out;
+}
+
 function registeredLocalAppData(prefix) {
   let reg;
   try {
@@ -74,10 +109,16 @@ function registeredLocalAppData(prefix) {
     }
     if (section === null) continue;
     const match = /^"Local AppData"=(?:str\(\d+\):)?"((?:[^"\\]|\\.)*)"\s*$/i.exec(line);
-    if (match) found[section] = match[1].replace(/\\(.)/g, "$1");
+    if (match) found[section] = unescapeRegString(match[1]);
   }
-  const windows = found["user shell folders"] ?? found["shell folders"];
-  if (windows === undefined || windows.includes("%")) return null;
+  // `User Shell Folders` usually holds `%USERPROFILE%\...`, which needs Wine to
+  // expand; `Shell Folders` holds the same thing already expanded. The first
+  // one that is a plain path wins -- a `%VAR%` in the override used to stop the
+  // search instead of falling through to the resolved key.
+  const windows = [found["user shell folders"], found["shell folders"]].find(
+    (value) => value !== undefined && !value.includes("%"),
+  );
+  if (windows === undefined) return null;
 
   const drive = /^([A-Za-z]):[\\/]?(.*)$/.exec(windows);
   if (drive === null) return null;
@@ -110,7 +151,10 @@ function registeredLocalAppData(prefix) {
 function inPrefix(prefix, label) {
   const found = [];
   const redirected = registeredLocalAppData(prefix);
-  if (redirected !== null && existsSync(redirected)) {
+  // Held to the same test as the in-prefix folders below: Studio has run there.
+  // A prefix made for some other program can point Local AppData anywhere, and
+  // installing would create Roblox/Plugins in it.
+  if (redirected !== null && existsSync(join(redirected, "Roblox"))) {
     found.push({ dir: join(redirected, "Roblox", "Plugins"), label: `${label}, Local AppData redirect` });
   }
   const users = join(prefix, "drive_c", "users");
@@ -174,9 +218,34 @@ export function pluginDirs(options = {}) {
   found.push(...inPrefix(join(home, ".wine"), "Wine default prefix"));
 
   // The same folder can be reached by two routes (a symlinked data directory is
-  // common); listing it twice would install into it twice.
+  // common); listing it twice would install into it twice, and make `doctor`
+  // report one install as two. Compared by where it really is, not by spelling.
   const seen = new Set();
-  return found.filter(({ dir }) => !seen.has(dir) && seen.add(dir));
+  return found.filter(({ dir }) => {
+    const real = canonical(dir);
+    if (seen.has(real)) return false;
+    seen.add(real);
+    return true;
+  });
+}
+
+/**
+ * The real location of a folder that may not exist yet (`Plugins` often does
+ * not): its nearest existing ancestor with symlinks resolved, plus the rest.
+ */
+function canonical(dir) {
+  const rest = [];
+  let at = resolve(dir);
+  for (;;) {
+    try {
+      return join(realpathSync(at), ...rest.reverse());
+    } catch {
+      const parent = dirname(at);
+      if (parent === at) return resolve(dir);
+      rest.push(basename(at));
+      at = parent;
+    }
+  }
 }
 
 /** What to say when there is nowhere to install, per platform. */

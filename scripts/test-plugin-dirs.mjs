@@ -8,10 +8,10 @@
  * Usage: node scripts/test-plugin-dirs.mjs
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pluginDirs } from "./plugin-dirs.mjs";
+import { pluginDirs, unescapeRegString } from "./plugin-dirs.mjs";
 
 const tail = join("AppData", "Local", "Roblox", "Plugins");
 const roblox = join("AppData", "Local", "Roblox");
@@ -86,6 +86,64 @@ assert.equal(new Set(withXdg).size, withXdg.length);
     [join(appdata, "Roblox", "Plugins"), join(prefix, "drive_c", "users", "steamuser", tail)],
     "redirect first, then the in-prefix profile",
   );
+}
+
+// Wine's .reg escapes, read back the way Wine reads them.
+assert.equal(unescapeRegString("a\\\\b"), "a\\b", "an escaped backslash");
+assert.equal(unescapeRegString('say \\"hi\\"'), 'say "hi"', "an escaped quote");
+assert.equal(unescapeRegString("K\\x00e2z\\x131m"), "Kâzım", "non-ASCII as \\x and 1-4 hex digits");
+assert.equal(unescapeRegString("x\\x0131a"), "xıa", "four digits when a hex letter follows");
+assert.equal(unescapeRegString("line\\nnext\\ttab"), "line\nnext\ttab", "control characters");
+assert.equal(unescapeRegString("\\101"), "A", "octal");
+
+{
+  const machine = mkdtempSync(join(tmpdir(), "studio-mcp-redirect2-"));
+  const prefix = join(machine, ".local", "share", "vinegar", "prefixes", "studio");
+  mkdirSync(join(prefix, "drive_c", "users", "steamuser"), { recursive: true });
+  const reg = (entries) =>
+    `WINE REGISTRY Version 2\n\n${entries
+      .map(([section, value]) => `[Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Explorer\\\\${section}] 1712345678\n${value}\n`)
+      .join("\n")}`;
+  // As Wine writes a path: backslashes doubled, anything above 127 as \x.
+  const asWine = (path) =>
+    "Z:" + [...path].map((c) => (c === "/" ? "\\\\" : c.charCodeAt(0) > 127 ? "\\x" + c.charCodeAt(0).toString(16).padStart(4, "0") : c)).join("");
+  const dirs = () => pluginDirs({ platform: "linux", env: {}, home: machine }).map((e) => e.dir);
+
+  // A home folder with Turkish letters: the redirect is still found.
+  const turkish = join(machine, "Kâzım", "appdata");
+  mkdirSync(join(turkish, "Roblox"), { recursive: true });
+  writeFileSync(join(prefix, "user.reg"), reg([["User Shell Folders", `"Local AppData"="${asWine(turkish)}"`]]));
+  assert.deepEqual(dirs(), [join(turkish, "Roblox", "Plugins")], "a non-ASCII redirect is decoded, not dropped");
+
+  // `User Shell Folders` holding %VAR% no longer stops the search: the resolved
+  // `Shell Folders` value is used.
+  writeFileSync(
+    join(prefix, "user.reg"),
+    reg([
+      ["User Shell Folders", `"Local AppData"=str(2):"%USERPROFILE%\\\\AppData\\\\Local"`],
+      ["Shell Folders", `"Local AppData"="${asWine(turkish)}"`],
+    ]),
+  );
+  assert.deepEqual(dirs(), [join(turkish, "Roblox", "Plugins")], "falls through to Shell Folders past a %VAR%");
+
+  // A redirect to a folder Studio never ran in (no Roblox inside) is not offered.
+  const foreign = join(machine, "other-app-data");
+  mkdirSync(foreign, { recursive: true });
+  writeFileSync(join(prefix, "user.reg"), reg([["User Shell Folders", `"Local AppData"="${asWine(foreign)}"`]]));
+  assert.deepEqual(dirs(), [], "a redirect without Roblox in it is skipped, like an in-prefix folder");
+}
+
+// One install reached by two routes -- the Flatpak data folder symlinked to the
+// native one -- is listed once, not twice.
+{
+  const machine = mkdtempSync(join(tmpdir(), "studio-mcp-symlink-"));
+  const nativeData = join(machine, ".local", "share", "vinegar");
+  mkdirSync(join(nativeData, "prefixes", "studio", "drive_c", "users", "steamuser", roblox), { recursive: true });
+  const flatpakParent = join(machine, ".var", "app", "org.vinegarhq.Vinegar", "data");
+  mkdirSync(flatpakParent, { recursive: true });
+  symlinkSync(nativeData, join(flatpakParent, "vinegar"));
+  const listed = pluginDirs({ platform: "linux", env: {}, home: machine });
+  assert.equal(listed.length, 1, `one folder, reached twice, listed once: ${JSON.stringify(listed)}`);
 }
 
 // A machine with nothing installed reports nothing rather than guessing.
