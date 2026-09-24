@@ -77,6 +77,30 @@ local performed = {}
 local released = {}
 
 --[[
+	Buttons an earlier call's `press` deliberately left down, by name.
+
+	A `press` is asked to stay down until a later `release` -- which can be in
+	the next call (hold fire, then aim; press, move, release as a drag). The
+	server remembers these per player and hands them over, so the up-front
+	release below leaves them alone instead of letting go at (0,0) and calling
+	a requested hold "stuck". Kept current as this plan presses and releases,
+	and sent back so the next call knows.
+]]
+local held = {}
+do
+	local okHeld, list = pcall(function()
+		return HttpService:JSONDecode(relay:GetAttribute("Held") or "[]")
+	end)
+	if okHeld and typeof(list) == "table" then
+		for _, name in list do
+			if typeof(name) == "string" then
+				held[name] = true
+			end
+		end
+	end
+end
+
+--[[
 	Where the client actually read the last pointer event, against where it was
 	aimed.
 
@@ -430,25 +454,48 @@ end
 	table empty -- including one that follows a call whose own cleanup never
 	ran (Studio was force-closed, the process died, `Destroying` fired too
 	late to matter). The real input system does not forget, though: the
-	button is still down in it, and previously the first click of the new
-	call paid for that discovery -- one press-time "duplicate button state"
-	recovery per stuck button, with its own note about a press nobody asked
-	for.
+	button is still down in it. A right button stuck that way is the worst of
+	them -- the camera then turns on every pointer move -- so it is cleared
+	here, before this plan's first click depends on it.
 
-	Releasing all three up front costs nothing when nothing is stuck: asking
-	to release a button already up is exactly the "duplicate" `sendButton`
-	already turns into "already up". When one genuinely was held, this is the
-	transition that clears it -- silently as far as the input system is
-	concerned, so it is surfaced here, once, rather than left for whichever
-	step happens to hit it first.
+	Three things it must not do:
+
+	- Undo a deliberate hold. A button in `held` was pressed on purpose by an
+	  earlier call and is waiting for its `release`; it is left alone.
+
+	- Pre-empt `release_all`. A plan that asks for one wants the per-button
+	  report of what was stuck; releasing everything first made that report
+	  read "already up" for a button that was stuck a moment earlier.
+
+	- Cry wolf. Whether a release of an up button throws ("duplicate") or is
+	  silently accepted is the engine's business, and if it is accepted,
+	  "the release went through" says nothing. So the warning needs
+	  `IsMouseButtonPressed` to say the button really was down; only when
+	  that cannot be read does it fall back to the release's own outcome. The
+	  release itself is sent either way -- it is harmless when up.
 ]]
-for _, name in { "MouseButton1", "MouseButton2", "MouseButton3" } do
-	local sent, how = sendButton(Vector2.new(0, 0), Enum.UserInputType[name], false)
-	if sent and how == "sent" then
-		table.insert(
-			notes,
-			string.format("%s was left down from an earlier call; released before this plan started.", name)
-		)
+local hasReleaseAll = false
+for _, step in plan do
+	if typeof(step) == "table" and step.kind == "release_all" then
+		hasReleaseAll = true
+	end
+end
+if not hasReleaseAll then
+	for _, name in { "MouseButton1", "MouseButton2", "MouseButton3" } do
+		if not held[name] then
+			local inputType = Enum.UserInputType[name]
+			local known, wasDown = pcall(function()
+				return UserInputService:IsMouseButtonPressed(inputType)
+			end)
+			local sent, how = sendButton(Vector2.new(0, 0), inputType, false)
+			local stuck = if known and typeof(wasDown) == "boolean" then wasDown else how == "sent"
+			if sent and how == "sent" and stuck then
+				table.insert(
+					notes,
+					string.format("%s was left down from an earlier call; released before this plan started.", name)
+				)
+			end
+		end
 	end
 end
 
@@ -545,6 +592,7 @@ local function runStep(step): boolean
 				table.insert(notes, string.format("%s was not released: %s", step.button or "MouseButton1", how))
 				return false
 			end
+			held[step.button or "MouseButton1"] = nil
 		else
 			local sent, how = sendButton(at, button, true)
 			if not sent then
@@ -559,6 +607,10 @@ local function runStep(step): boolean
 				task.wait(step.hold or 0.05)
 				sendButton(at, button, false)
 				tapping.buttons[button] = nil
+				-- A tap ends with the button up, even one that was being held.
+				held[step.button or "MouseButton1"] = nil
+			else
+				held[step.button or "MouseButton1"] = true
 			end
 		end
 	elseif kind == "release_all" then
@@ -575,6 +627,9 @@ local function runStep(step): boolean
 		for _, name in { "MouseButton1", "MouseButton2", "MouseButton3" } do
 			local sent, how = sendButton(at, Enum.UserInputType[name], false)
 			released[name] = if sent then how else ("failed: " .. how)
+			if sent then
+				held[name] = nil
+			end
 		end
 		if step.key ~= nil then
 			local sent = sendKey(Enum.KeyCode[step.key], false)
@@ -645,6 +700,15 @@ report:FireServer({
 	ok = true,
 	performed = performed,
 	released = if next(released) ~= nil then released else nil,
+	-- Buttons still deliberately held when the plan ended, as a list.
+	held = (function()
+		local list = {}
+		for name in held do
+			table.insert(list, name)
+		end
+		table.sort(list)
+		return list
+	end)(),
 	landed = landed,
 	-- Sent only when there is something to say: an empty Lua table crosses as
 	-- an object rather than an array, and a caller iterating it would trip.
@@ -745,6 +809,16 @@ local function planFrom(params: { [string]: any }): { { [string]: any } }
 	return plan
 end
 
+--[[
+	Buttons each player's earlier plans deliberately left down with `press`,
+	as the relay last reported them. Handed to the next relay so its up-front
+	release leaves a requested hold alone.
+
+	Weak keys: every playtest makes a new Player, so a test that ends takes
+	its entry with it -- a hold never outlives the playtest it was made in.
+]]
+local heldByPlayer: { [any]: { string } } = setmetatable({}, { __mode = "k" }) :: any
+
 function Input.send(params: { [string]: any }): { [string]: any }
 	--[[
 		Refused rather than attempted. In an edit session VirtualInput does work,
@@ -772,12 +846,27 @@ function Input.send(params: { [string]: any }): { [string]: any }
 		budget += (step.hold or 0) + (step.after or 0) + 0.5
 	end
 	local result = ClientRelay.run(player, "MCPInputRelay", RELAY_SOURCE, {
-		Plan = HttpService:JSONEncode(plan), Cursor = params.cursor ~= false, Budget = budget,
+		Plan = HttpService:JSONEncode(plan),
+		Held = HttpService:JSONEncode(heldByPlayer[player] or {}),
+		Cursor = params.cursor ~= false,
+		Budget = budget,
 	}, budget + 2)
 
 	if result.ok ~= true then
 		Dispatch.fail("INPUT_FAILED", tostring(result.reason or "the client refused the plan"))
 	end
+
+	-- Only a relay that finished can say what it left held; a failed one keeps
+	-- the previous answer rather than forgetting a hold it never touched.
+	local stillHeld = {}
+	if typeof(result.held) == "table" then
+		for _, name in result.held do
+			if typeof(name) == "string" then
+				table.insert(stillHeld, name)
+			end
+		end
+	end
+	heldByPlayer[player] = stillHeld
 
 	return {
 		delivered = true,
@@ -786,6 +875,8 @@ function Input.send(params: { [string]: any }): { [string]: any }
 		performed = result.performed,
 		-- Per-button outcome of a `release_all` step, when there was one.
 		released = result.released,
+		-- Buttons a `press` deliberately left down, awaiting their `release`.
+		held = if #stillHeld > 0 then stillHeld else nil,
 		--[[
 			Named so the caller can tell why a click that was delivered still hit
 			nothing. `landed` carries the arithmetic; this says what to turn off.

@@ -35,6 +35,7 @@ const suites = [
   { module: "plugin/src/ClientRelay.luau", test: "tests/client-relay.luau", prelude: "tests/client-relay-stub.luau" },
   { module: "plugin/src/handlers/Exec.luau", test: "tests/exec-client.luau", prelude: "tests/exec-client-stub.luau" },
   { module: "plugin/src/handlers/Anim.luau", test: "tests/anim.luau", prelude: "tests/anim-stub.luau" },
+  { module: "plugin/src/handlers/Input.luau", test: "tests/input-send.luau", prelude: "tests/input-send-stub.luau" },
   { module: "plugin/src/LogBuffer.luau", test: "tests/log-buffer.luau", prelude: "tests/log-buffer-stub.luau" },
   { module: "plugin/src/handlers/Perf.luau", test: "tests/perf-console.luau", prelude: "tests/perf-console-stub.luau" },
   { module: "plugin/src/TextEdit.luau", test: "tests/textedit.luau" },

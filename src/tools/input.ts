@@ -18,6 +18,8 @@ interface InputResponse {
   steps: number;
   player: string;
   performed?: string[];
+  /** Mouse buttons a `press` left down on purpose, across calls, awaiting a `release`. */
+  held?: string[];
   /** What a `release_all` step found for each button: "sent", "already up", or a failure. */
   released?: Record<string, string>;
   /** Steps that were delivered and still did nothing, in the client's words. */
@@ -182,7 +184,9 @@ export function registerInputTools(context: ToolContext): void {
                     "'tap' presses and releases (the default), 'press' holds it " +
                       "down until a later 'release', 'release' lets go and sends no " +
                       "press. Use press/release across steps to hold a key or button " +
-                      "while doing something else.",
+                      "while doing something else. A mouse button `press` also stays " +
+                      "down across calls (a drag can end in the next call); the reply's " +
+                      "`held` lists buttons still down that way, awaiting their release.",
                   ),
                 button: z
                   .enum(["MouseButton1", "MouseButton2", "MouseButton3"])
