@@ -2,6 +2,10 @@
 -- KeyframeSequenceProvider that records what it was asked to register, and the
 -- three helper modules Anim.luau requires.
 local registered = {}
+-- Every track an Animator stub loaded, so a test can see whether it was cleaned up.
+local loadedClips = {}
+-- Simulated time: each wait is one frame.
+local task = { wait = function() return 1 / 60 end }
 local dataOf = {}
 
 local function make(class)
@@ -22,6 +26,39 @@ local function make(class)
 	end
 	function methods.Destroy()
 		data.destroyed = true
+	end
+	-- For `preview`: a host that finds its children by class, attributes, and
+	-- an Animator whose tracks never get a length (so the timeout path runs
+	-- without any network).
+	function methods.FindFirstChildWhichIsA(class)
+		for _, kid in data.kids do
+			if kid.ClassName == class and not kid.destroyed then
+				return kid
+			end
+		end
+		return nil
+	end
+	function methods.GetDescendants()
+		return {}
+	end
+	function methods.SetAttribute(name, value)
+		data.attributes = data.attributes or {}
+		data.attributes[name] = value
+	end
+	function methods.GetAttribute(name)
+		return (data.attributes or {})[name]
+	end
+	function methods.GetPlayingAnimationTracks()
+		return data.tracks or {}
+	end
+	function methods.StepAnimations() end
+	function methods.LoadAnimation()
+		local clip = { Length = 0, destroyed = false }
+		function clip.Destroy(self)
+			self.destroyed = true
+		end
+		table.insert(loadedClips, clip)
+		return clip
 	end
 	function methods.Clone()
 		local copy = make(class)
@@ -101,6 +138,9 @@ local game = {
 -- Rigs a test registers by path: `joints` is a list of { part0, part1 } names,
 -- each a Motor6D in the model; `primary` names its PrimaryPart.
 local rigs = {}
+local function defineInstance(path, instance)
+	rigs[path] = instance
+end
 local function defineRig(path, joints, primary)
 	local motors = {}
 	for _, pair in joints do

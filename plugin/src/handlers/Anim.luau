@@ -1206,6 +1206,9 @@ end
 	before returning would always photograph the idle pose. `op="stop"` puts it
 	back.
 ]]
+-- Marks an Animator that `preview` added, so `stop` knows it may take it away.
+local PREVIEW_ANIMATOR = "StudioMCPPreviewAnimator"
+
 function Anim.preview(params: { [string]: any }): { [string]: any }
 	local rigPath = params.rig
 	if typeof(rigPath) ~= "string" or rigPath == "" then
@@ -1237,13 +1240,18 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		)
 	end
 	animator = (host :: Instance):FindFirstChildWhichIsA("Animator")
-	if animator == nil then
-		local created = Instance.new("Animator")
-		created.Parent = host
-		animator = created
-	end
 
 	if params.op == "stop" then
+		-- Nothing was ever played through an Animator that does not exist, and
+		-- making one just to find nothing on it would add an instance to the
+		-- place for no reason.
+		if animator == nil then
+			return {
+				rig = Paths.of(model),
+				stopped = 0,
+				note = "Nothing to stop: this rig has no Animator, so nothing was previewed on it.",
+			}
+		end
 		local stopped = 0
 		for _, track in (animator :: Animator):GetPlayingAnimationTracks() do
 			track:Stop(0)
@@ -1251,14 +1259,42 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		end
 		restPose(model, animator :: Animator)
 		local left = #(animator :: Animator):GetPlayingAnimationTracks()
+		--[[
+			An Animator `preview` added is taken away again, so the place ends up
+			as it was found. One the rig already had is the game's and stays.
+		]]
+		local removed = false
+		if left == 0 and (animator :: Animator):GetAttribute(PREVIEW_ANIMATOR) == true then
+			local own = animator :: Animator
+			Undo.record("StudioMCP.AnimPreviewAnimator", "MCP remove preview Animator", function()
+				own:Destroy()
+			end)
+			removed = true
+		end
 		return {
 			rig = Paths.of(model),
 			stopped = stopped,
 			stillPlaying = if left > 0 then left else nil,
+			removedAnimator = if removed then true else nil,
 			note = if left > 0
 				then "Some tracks are still playing, so the rig may still be posed."
 				else "The rig is back in its rest pose.",
 		}
+	end
+
+	if animator == nil then
+		--[[
+			Added as an undoable step and marked as preview's own, so `stop`
+			removes it again. It used to be added outside any recording and left
+			in the place for good -- saved with it, and invisible to Ctrl+Z.
+		]]
+		local target = host :: Instance
+		animator = Undo.record("StudioMCP.AnimPreviewAnimator", "MCP add Animator for preview", function()
+			local created = Instance.new("Animator")
+			created:SetAttribute(PREVIEW_ANIMATOR, true)
+			created.Parent = target
+			return created
+		end)
 	end
 
 	local id = contentId(params)
@@ -1320,6 +1356,9 @@ function Anim.preview(params: { [string]: any }): { [string]: any }
 		waited += task.wait()
 	end
 	if clip.Length == 0 then
+		-- The track too, not just the Animation: a failed preview otherwise
+		-- leaves a dead track on the rig's Animator for every attempt.
+		clip:Destroy()
 		animation:Destroy()
 		Dispatch.fail(
 			"ANIMATION_TIMEOUT",

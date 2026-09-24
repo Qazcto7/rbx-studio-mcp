@@ -163,5 +163,40 @@ assert(okLoop, "a joint loop is survived, got " .. tostring(if typeof(loop) == "
 assert(loop.root == "Root")
 assert(loop.unrootedJoints ~= nil and #loop.unrootedJoints == 2, "both looping joints are reported")
 
+-- preview/stop and the Animator. `stop` on a rig with none does not make one;
+-- `preview` makes one as an undoable, marked step; `stop` takes that one away
+-- again but leaves a game's own Animator alone; a timeout destroys its track.
+local function dummy(path, withAnimator)
+	local model = Instance.new("Model")
+	model.Name = "Dummy"
+	local humanoid = Instance.new("Humanoid")
+	humanoid.Parent = model
+	if withAnimator then
+		Instance.new("Animator").Parent = humanoid
+	end
+	defineInstance(path, model)
+	return humanoid
+end
+local hash = string.rep("b", 32)
+
+local bare = dummy("Workspace.Bare", false)
+local stoppedBare = Anim.preview({ op = "stop", rig = "Workspace.Bare" })
+assert(stoppedBare.stopped == 0)
+assert(bare:FindFirstChildWhichIsA("Animator") == nil, "stop makes no Animator just to find nothing")
+
+local okPreview, previewErr = pcall(Anim.preview, { rig = "Workspace.Bare", assetId = hash })
+assert(not okPreview and previewErr.code == "ANIMATION_TIMEOUT", "a track with no length times out")
+assert(loadedClips[#loadedClips].destroyed, "the timed-out track is destroyed, not left on the Animator")
+local made = bare:FindFirstChildWhichIsA("Animator")
+assert(made ~= nil and made:GetAttribute("StudioMCPPreviewAnimator") == true, "preview's Animator is marked as its own")
+
+local cleared = Anim.preview({ op = "stop", rig = "Workspace.Bare" })
+assert(cleared.removedAnimator == true and made.destroyed, "stop takes preview's own Animator away again")
+
+local owned = dummy("Workspace.Owned", true)
+local gameAnimator = owned:FindFirstChildWhichIsA("Animator")
+local keptOwn = Anim.preview({ op = "stop", rig = "Workspace.Owned" })
+assert(keptOwn.removedAnimator == nil and not gameAnimator.destroyed, "the game's own Animator stays")
+
 print("anim build: padding, preview-only labelling and kept instances pass")
 print("anim play: relay wiring, rig fallback and failure mapping pass")
