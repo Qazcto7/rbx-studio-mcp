@@ -62,7 +62,12 @@ export function registerAnimTools(context: ToolContext): void {
         "dead). For an animation that must run in the game, pass `parent` (e.g. " +
         "the Tool): `build` then leaves a real KeyframeSequence instance there, " +
         "and `play` loads and plays it on a running playtest's client in one " +
-        "call — no hand-written execute_luau needed.\n\n" +
+        "call — no hand-written execute_luau needed. The sequence must be " +
+        "somewhere the client can see (Workspace, ReplicatedStorage, the rig or " +
+        "a Tool in the workspace — NOT ServerStorage). A new `play` replaces the " +
+        "one before it on that rig instead of stacking, and `stop` addressed to " +
+        "the playtest's studioId stops it; the game's own animations are left " +
+        "alone.\n\n" +
         "Give `build` at least two keyframes at different times. A single " +
         "keyframe has zero length, and a zero-length animation cannot be " +
         "previewed (the preview times out). A single or all-at-time-0 animation is " +
@@ -84,13 +89,14 @@ export function registerAnimTools(context: ToolContext): void {
             "'read' downloads an existing animation, 'preview' poses a rig at one " +
               "moment of it so you can screenshot it, 'build' makes a new one " +
               "playable here, 'play' loads and plays a kept KeyframeSequence on a " +
-              "running playtest's client, 'stop' clears a preview.",
+              "running playtest's client, 'stop' clears a preview (edit) or stops " +
+              "what `play` started (when addressed to a playtest).",
           ),
         assetId: z
           .union([z.number(), z.string()])
           .optional()
           .describe(
-            'read only: animation asset id (12345), "rbxassetid://12345", or the ' +
+            'read and preview: animation asset id (12345), "rbxassetid://12345", or the ' +
               'path of an Animation instance ("Workspace.Rig.Animate.run").',
           ),
         keyframes: z
@@ -116,10 +122,13 @@ export function registerAnimTools(context: ToolContext): void {
           .optional()
           .describe(
             "build only: path to keep the built KeyframeSequence under as a real " +
-              'instance (e.g. "Workspace.Rig.Tool" or "ServerStorage"). This is how ' +
-              "to make an animation that works in a real playtest: `play` (or the " +
-              "returned `instance`, for hand-written client code) loads and plays " +
-              "it there. One undo step.",
+              'instance (e.g. "Workspace.Rig.Tool" or "ReplicatedStorage"). This is ' +
+              "how to make an animation that works in a real playtest: `play` (or " +
+              "the returned `instance`, for hand-written client code) loads and " +
+              "plays it there. `play` runs on the client, so put it somewhere the " +
+              "client can see — ServerStorage and ServerScriptService never " +
+              "replicate, and a Tool still in StarterPack is not at that path " +
+              "during a playtest. One undo step.",
           ),
         root: z
           .string()
@@ -142,8 +151,8 @@ export function registerAnimTools(context: ToolContext): void {
               "`build` it is optional and is read for its joint layout — pass it for " +
               "anything that is not a standard R6 or R15 character (a custom rig, a " +
               "weapon, a door, a Blender import), or the poses may be attached in the " +
-              "wrong order and the animation will move nothing. For `play`, it is " +
-              "optional and defaults to the player's own character.",
+              "wrong order and the animation will move nothing. For `play` (and `stop` " +
+              "in a playtest), it is optional and defaults to the player's own character.",
           ),
         sequence: z
           .string()
@@ -156,7 +165,7 @@ export function registerAnimTools(context: ToolContext): void {
         player: z
           .string()
           .optional()
-          .describe("play only: which player, by name. Omit for the only one in the playtest."),
+          .describe("play (and stop in a playtest): which player, by name. Omit for the only one in the playtest."),
         fadeTime: z
           .number()
           .optional()
@@ -206,8 +215,41 @@ export function registerAnimTools(context: ToolContext): void {
         return json(played);
       }
 
+      /*
+       * `stop` means two different things, told apart by where it is sent.
+       * In a playtest it stops what `play` started -- on the client, where it is
+       * playing; `preview`'s stop runs in the session it is sent to and resets
+       * the rig's joints, which never reaches a track on a client's Animator.
+       * In edit mode it clears a preview, as it always has.
+       */
+      if (args.op === "stop") {
+        const { list, activeId } = await bridge.sessions();
+        const wanted = args.studioId ?? activeId ?? (list.length === 1 ? list[0]?.studioId : undefined);
+        const target = list.find((session) => session.studioId === wanted);
+        if ((target?.context ?? "").startsWith("playtest")) {
+          const stopped = await bridge.call<Record<string, unknown>>(
+            "anim.stopPlay",
+            { rig: args.rig, player: args.player },
+            { studioId: args.studioId, timeoutMs: TIMEOUT_MS },
+          );
+          return json(
+            stopped,
+            stopped["stopped"] === 0
+              ? "Nothing to stop: no animation that `play` started is playing on that rig."
+              : undefined,
+          );
+        }
+      }
+
       if (args.op === "preview" || args.op === "stop") {
-        if (!args.rig) return text("preview needs a `rig` — the model to pose.");
+        if (!args.rig) {
+          return text(
+            args.op === "stop"
+              ? "stop needs a `rig` in edit mode (the previewed model). To stop what " +
+                  "`play` started, address `stop` to the playtest's studioId."
+              : "preview needs a `rig` — the model to pose.",
+          );
+        }
         const posed = await bridge.call<Record<string, unknown>>(
           "anim.preview",
           { op: args.op, rig: args.rig, assetId: args.assetId, at: args.at, hold: args.hold },
@@ -246,7 +288,11 @@ export function registerAnimTools(context: ToolContext): void {
                 `playtest, \`animation op="play" sequence="${kept}"\` loads and plays it ` +
                 "on the player's character (or pass `rig` for anything else) — no " +
                 "hand-written client code needed.\n\n"
-              : "Pass `parent` to keep a real KeyframeSequence in the place for gameplay use.\n\n") +
+              : args.parent !== undefined
+                ? `\`parent\` was given but NOTHING WAS KEPT: ${
+                    typeof built["instanceNote"] === "string" ? built["instanceNote"] : "the plugin did not say why"
+                  }. Fix that and build again before using this for gameplay.\n\n`
+                : "Pass `parent` to keep a real KeyframeSequence in the place for gameplay use.\n\n") +
             "`hierarchy` says which joint layout the poses were nested against — the " +
             "rig you named, or the R6/R15 standard guessed from the joint names. " +
             "Anything in `unmatchedJoints` is a name that layout does not contain: " +

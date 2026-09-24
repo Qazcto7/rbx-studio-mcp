@@ -58,6 +58,7 @@ assert(not okMissing and missingErr.code == "BAD_PARAMS", "play refuses without 
 local played = Anim.play({ sequence = "Workspace.Rig.Tool.MCPAnimation" })
 local call = relayCalls[#relayCalls]
 assert(call.name == "MCPAnimPlayRelay")
+assert(call.attributes.Mode == "play", "the relay is told to play")
 assert(call.attributes.Sequence == "Workspace.Rig.Tool.MCPAnimation")
 assert(call.attributes.Rig == nil, "no rig means no Rig attribute at all -- the client falls back to the character")
 local clonedNames = {}
@@ -81,6 +82,33 @@ local okFail, failErr = pcall(Anim.play, { sequence = "Workspace.Nope" })
 nextRelayAnswer = nil
 assert(not okFail and failErr.code == "ANIMATION_PLAY_FAILED", "a client refusal becomes ANIMATION_PLAY_FAILED")
 assert(string.find(failErr.message, "sequence not found", 1, true), "the client's reason survives")
+
+-- A replaced earlier track is passed through, so the reply can say so.
+nextRelayAnswer = { ok = true, animationId = "session-hash", length = 1, replaced = 1 }
+assert(Anim.play({ sequence = "Workspace.Seq" }).replaced == 1, "`replaced` reaches the reply")
+nextRelayAnswer = nil
+
+-- `stopPlay` runs the same relay in stop mode: no sequence, the rig passed on,
+-- the same modules cloned, and a refusal mapped to its own code.
+nextRelayAnswer = { ok = true, stopped = 2 }
+local stoppedReply = Anim.stopPlay({ rig = "Workspace.OtherRig", player = "P2" })
+call = relayCalls[#relayCalls]
+assert(call.name == "MCPAnimStopRelay")
+assert(call.attributes.Mode == "stop", "the relay is told to stop")
+assert(call.attributes.Sequence == nil, "stop needs no sequence")
+assert(call.attributes.Rig == "Workspace.OtherRig")
+local stopCloned = 0
+for _ in call.relay:GetChildren() do
+	stopCloned += 1
+end
+assert(stopCloned == 2, "Paths and Dispatch go with the stop relay too")
+assert(stoppedReply.stopped == 2)
+nextRelayAnswer = { ok = true }
+assert(Anim.stopPlay({}).stopped == 0, "an answer without a count means none stopped")
+nextRelayAnswer = { ok = false, reason = "the local player has no character" }
+local okStop, stopErr = pcall(Anim.stopPlay, {})
+nextRelayAnswer = nil
+assert(not okStop and stopErr.code == "ANIMATION_STOP_FAILED")
 
 print("anim build: padding, preview-only labelling and kept instances pass")
 print("anim play: relay wiring, rig fallback and failure mapping pass")

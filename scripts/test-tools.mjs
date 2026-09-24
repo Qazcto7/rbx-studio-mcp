@@ -370,6 +370,64 @@ process.stdout.write("playtest lock leaves edit-mode tools available: ok\n");
 }
 process.stdout.write("animation: preview-only labelling and warnings ok\n");
 
+// `stop` is routed by where it is sent: in a playtest it stops what `play`
+// started, on the client; in edit mode it clears a preview, as before.
+{
+ const { registerAnimTools } = await import("../dist/tools/anim.js");
+ const tools = new Map();
+ const seen = [];
+ let sessions = [];
+ registerAnimTools({
+  server: { registerTool(name, spec, handler) { tools.set(name, { spec, handler }); } },
+  bridge: {
+   async sessions() { return { list: sessions, activeId: null }; },
+   async call(op, params, options) { seen.push({ op, params, options }); return op === "anim.stopPlay" ? { stopped: 1, player: "P1" } : { cleared: true }; },
+  },
+ });
+ const anim = tools.get("animation");
+ const parse = (args) => z.object(anim.spec.inputSchema).parse(args);
+
+ sessions = [{ studioId: "edit", context: "edit" }, { studioId: "run", context: "playtest server" }];
+ await anim.handler(parse({ op: "stop", studioId: "run", player: "P1" }));
+ assert.equal(seen.at(-1).op, "anim.stopPlay", "a stop sent to the playtest stops what play started");
+ assert.deepEqual(seen.at(-1).params, { rig: undefined, player: "P1" });
+
+ await anim.handler(parse({ op: "stop", studioId: "edit", rig: "Workspace.Dummy" }));
+ assert.equal(seen.at(-1).op, "anim.preview", "a stop sent to the editor clears a preview");
+ assert.equal(seen.at(-1).params.op, "stop");
+
+ const count = seen.length;
+ const noRig = await anim.handler(parse({ op: "stop", studioId: "edit" }));
+ assert.equal(seen.length, count, "nothing is sent without a rig in edit mode");
+ assert.match(noRig.content[0].text, /address `stop` to the playtest's studioId/);
+
+ // The only session is a playtest: no studioId needed.
+ sessions = [{ studioId: "run", context: "playtest server" }];
+ await anim.handler(parse({ op: "stop" }));
+ assert.equal(seen.at(-1).op, "anim.stopPlay");
+
+ assert.doesNotMatch(anim.spec.inputSchema.parent.description, /ServerStorage"/, "no longer suggests a place the client cannot see");
+}
+process.stdout.write("animation: stop routed by session ok\n");
+
+// A `parent` that could not be kept is said plainly, with the plugin's reason --
+// not answered with "Pass `parent`", which the caller already did.
+{
+ const { registerAnimTools } = await import("../dist/tools/anim.js");
+ const tools = new Map();
+ registerAnimTools({
+  server: { registerTool(name, spec, handler) { tools.set(name, { spec, handler }); } },
+  bridge: { async call() { return { animationId: "a".repeat(32), keyframeCount: 2, hierarchy: "R6", instanceNote: "parent: Workspace.Nope does not exist" }; } },
+ });
+ const anim = tools.get("animation");
+ const reply = await anim.handler(z.object(anim.spec.inputSchema).parse({
+  op: "build", parent: "Workspace.Nope", keyframes: [{ time: 0, poses: { "Right Arm": "0, 1, 0" } }, { time: 0.5 }],
+ }));
+ assert.match(reply.content[0].text, /NOTHING WAS KEPT: parent: Workspace\.Nope does not exist/);
+ assert.doesNotMatch(reply.content[0].text, /Pass `parent` to keep/);
+}
+process.stdout.write("animation: failed parent reported ok\n");
+
 // The T-pose warning must fire through the real `create` handler, not just the
 // helper: by the time `create` checked, property typing had already rewritten
 // AnimationId into `{ value, type }`, which the old check never matched -- so

@@ -594,6 +594,10 @@ local DESCRIBERS: { [string]: Describer } = {
 		local rig = leaf(params.rig)
 		return if rig ~= nil then string.format("Play %s on %s", sequence, rig) else "Play " .. sequence
 	end,
+	["anim.stopPlay"] = function(params)
+		local rig = leaf(params.rig)
+		return if rig ~= nil then "Stop the MCP animation on " .. rig else "Stop the MCP animation on the player"
+	end,
 
 	["data.list"] = function(params)
 		local store = params.store
@@ -789,7 +793,7 @@ function Phrase.kindOf(op: string): string
 		return if action == "read" or action == "grep" then "read" else "write"
 	end
 	-- Same shape as the script group: one read sitting among writes.
-	if op == "audio.inspect" then
+	if op == "audio.inspect" or op == "anim.read" then
 		return "read"
 	end
 	return KINDS[group] or "read"

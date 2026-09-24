@@ -759,23 +759,53 @@ local function describe(err)
 	return tostring(err)
 end
 
+-- The name on every Animation this relay plays. Tracks outlive the relay (it
+-- is destroyed the moment it reports), so this is how a later `play` or
+-- `stop` finds exactly the tracks MCP started -- and leaves the game's own
+-- walk, idle and tool animations alone.
+local TAG = "MCPPlay"
+
+-- How long to wait for things a playtest makes shortly AFTER it starts: the
+-- character, its Humanoid (a character can be parented before its children
+-- have all replicated), and the Animator the server normally creates.
+local CHARACTER_WAIT = 8
+local HUMANOID_WAIT = 5
+local ANIMATOR_WAIT = 2
+
+local function waitFor(find, seconds)
+	local found = find()
+	local deadline = os.clock() + seconds
+	while found == nil and os.clock() < deadline do
+		task.wait(0.1)
+		found = find()
+	end
+	return found
+end
+
+-- "play" loads and plays `Sequence`; "stop" only stops what earlier plays left.
+local mode = relay:GetAttribute("Mode") or "play"
 local sequencePath = relay:GetAttribute("Sequence")
 local rigPath = relay:GetAttribute("Rig")
 
-local okSequence, sequence = pcall(Paths.resolve, sequencePath)
-if not okSequence then
-	report:FireServer({ ok = false, reason = "sequence " .. describe(sequence) })
-	return
-end
-if not sequence:IsA("KeyframeSequence") then
-	report:FireServer({
-		ok = false,
-		reason = tostring(sequencePath) .. " is a " .. sequence.ClassName .. ", not a KeyframeSequence.",
-	})
-	return
+local sequence
+if mode == "play" then
+	local okSequence, found = pcall(Paths.resolve, sequencePath)
+	if not okSequence then
+		report:FireServer({ ok = false, reason = "sequence " .. describe(found) })
+		return
+	end
+	if not found:IsA("KeyframeSequence") then
+		report:FireServer({
+			ok = false,
+			reason = tostring(sequencePath) .. " is a " .. found.ClassName .. ", not a KeyframeSequence.",
+		})
+		return
+	end
+	sequence = found
 end
 
 local target
+local ownCharacter = false
 if typeof(rigPath) == "string" and rigPath ~= "" then
 	local okRig, rig = pcall(Paths.resolve, rigPath)
 	if not okRig then
@@ -784,18 +814,27 @@ if typeof(rigPath) == "string" and rigPath ~= "" then
 	end
 	target = rig
 else
-	local character = Players.LocalPlayer.Character
+	local character = waitFor(function()
+		return Players.LocalPlayer.Character
+	end, CHARACTER_WAIT)
 	if character == nil then
 		report:FireServer({
 			ok = false,
-			reason = "the local player has no character yet; wait for it to spawn, or pass `rig` to play on something else.",
+			reason = string.format(
+				"the local player has no character (waited %ds); wait for it to spawn, or pass `rig` to use something else.",
+				CHARACTER_WAIT
+			),
 		})
 		return
 	end
 	target = character
+	ownCharacter = true
 end
 
-local controller = target:FindFirstChildOfClass("Humanoid") or target:FindFirstChildOfClass("AnimationController")
+local function findController()
+	return target:FindFirstChildOfClass("Humanoid") or target:FindFirstChildOfClass("AnimationController")
+end
+local controller = if ownCharacter then waitFor(findController, HUMANOID_WAIT) else findController()
 if controller == nil then
 	report:FireServer({
 		ok = false,
@@ -804,7 +843,47 @@ if controller == nil then
 	return
 end
 
-local animator = controller:FindFirstChildOfClass("Animator")
+--[[
+	Waited for before one is made. On a player's character the server creates
+	the Animator, and it can arrive a moment after the Humanoid; a client that
+	makes its own in that gap ends up with a second Animator, and animations
+	played through a client-made one do not replicate to other players.
+]]
+local animator = waitFor(function()
+	return controller:FindFirstChildOfClass("Animator")
+end, ANIMATOR_WAIT)
+
+-- Whatever an earlier `play` left on this rig. Stopped and destroyed before a
+-- new one starts: nothing else ever stops them, so repeated plays of a
+-- looping animation used to stack, each at full weight.
+local stopped = 0
+if animator ~= nil then
+	local okTracks, tracks = pcall(function()
+		return animator:GetPlayingAnimationTracks()
+	end)
+	if okTracks and typeof(tracks) == "table" then
+		for _, track in tracks do
+			local okName, name = pcall(function()
+				return track.Animation and track.Animation.Name
+			end)
+			if okName and name == TAG then
+				pcall(function()
+					track:Stop(0)
+				end)
+				pcall(function()
+					track:Destroy()
+				end)
+				stopped += 1
+			end
+		end
+	end
+end
+
+if mode == "stop" then
+	report:FireServer({ ok = true, stopped = stopped })
+	return
+end
+
 if animator == nil then
 	-- Ordinary for a rig that has never played anything yet; games create this
 	-- the same way, on first use.
@@ -826,6 +905,7 @@ if not okId then
 end
 
 local anim = Instance.new("Animation")
+anim.Name = TAG
 anim.AnimationId = id
 
 local okTrack, track = pcall(function()
@@ -844,11 +924,14 @@ report:FireServer({
 	length = track.Length,
 	looped = track.Looped,
 	priority = tostring(track.Priority),
+	replaced = stopped,
 })
 ]==]
 
--- Long enough to cover a character that has not finished spawning yet.
-local PLAY_TIMEOUT = 20
+-- The relay's own waits (character 8s, Humanoid 5s, Animator 2s) plus the
+-- relay's start-up and the register/load itself, with room to spare -- and
+-- still well inside the server's 45s wait for this call.
+local PLAY_TIMEOUT = 25
 
 function Anim.play(params: { [string]: any }): { [string]: any }
 	if typeof(params.sequence) ~= "string" or params.sequence == "" then
@@ -862,6 +945,7 @@ function Anim.play(params: { [string]: any }): { [string]: any }
 
 	local player = ClientRelay.playerFor(params.player)
 	local result = ClientRelay.run(player, "MCPAnimPlayRelay", CLIENT_PLAY_SOURCE, {
+		Mode = "play",
 		Sequence = params.sequence,
 		Rig = if typeof(params.rig) == "string" then params.rig else nil,
 		FadeTime = if typeof(params.fadeTime) == "number" then params.fadeTime else nil,
@@ -884,12 +968,44 @@ function Anim.play(params: { [string]: any }): { [string]: any }
 	return {
 		played = true,
 		player = player.Name,
-		-- Session-local, the same as `build`'s id: good for this playtest only,
-		-- and only useful here as the thing a later `op="stop"` can target.
+		-- Session-local, the same as `build`'s id: good for this playtest only.
 		animationId = result.animationId,
 		length = result.length,
 		looped = result.looped,
 		priority = result.priority,
+		-- Tracks an earlier `play` had left on this rig, stopped first so they
+		-- do not stack. `op="stop"` in the playtest stops this one the same way.
+		replaced = result.replaced,
+	}
+end
+
+--[[
+	Stops what `play` started, on the client where it is playing.
+
+	`preview`'s `stop` cannot: it runs in the session it is sent to, poses with
+	edit-mode StepAnimations and resets the rig's joints -- none of which
+	reaches a track playing on a playtest client's own Animator. Only the
+	tracks `play` tagged are touched; the game's own animations carry on.
+]]
+function Anim.stopPlay(params: { [string]: any }): { [string]: any }
+	local player = ClientRelay.playerFor(params.player)
+	local result = ClientRelay.run(player, "MCPAnimStopRelay", CLIENT_PLAY_SOURCE, {
+		Mode = "stop",
+		Rig = if typeof(params.rig) == "string" then params.rig else nil,
+	}, PLAY_TIMEOUT, function(relay)
+		for _, name in { "Paths", "Dispatch" } do
+			local copy = script.Parent.Parent[name]:Clone()
+			copy.Parent = relay
+		end
+	end)
+
+	if result.ok ~= true then
+		Dispatch.fail("ANIMATION_STOP_FAILED", tostring(result.reason or "the client refused to stop it"))
+	end
+
+	return {
+		stopped = result.stopped or 0,
+		player = player.Name,
 	}
 end
 
@@ -1232,6 +1348,7 @@ function Anim.register()
 		preview = Anim.preview,
 		build = Anim.build,
 		play = Anim.play,
+		stopPlay = Anim.stopPlay,
 	})
 end
 
