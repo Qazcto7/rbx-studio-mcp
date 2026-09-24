@@ -75,4 +75,36 @@ assert(wedged.control({op = "state"}).state.testPending, "and it is the new one 
 queued[1]()
 assert(wedged.control({op = "state"}).state.testPending, "a superseded launch cannot clear the current one")
 deferLaunch = false
+
+-- The reaper needs edit mode to be KNOWN. pending stays true through a whole
+-- healthy test, so an unreadable EditModeActive must not turn a long-running
+-- test into an "abandoned start".
+local unknown = loadModule(); setup(unknown); unknown.setAllowed(true)
+running, runMode, clientContext = false, false, false
+deferLaunch = true
+queued = {}
+unknown.control({op = "play"})
+StudioTestService.EditModeActive = nil
+fakeNow += 200
+local keptUnknown = unknown.control({op = "stop"})
+assert(keptUnknown.state.testPending and not keptUnknown.changed, "unreadable edit mode: not reaped")
+local okUnknown, stillUnknown = pcall(unknown.control, {op = "play"})
+assert(not okUnknown and string.find(stillUnknown.hint, "poll op 'state'", 1, true), "and not told stop will clear it")
+StudioTestService.EditModeActive = false
+local keptRunning = unknown.control({op = "stop"})
+assert(keptRunning.state.testPending, "a test that is running (edit mode false) is not reaped")
+StudioTestService.EditModeActive = true
+
+-- A reaped launch that comes back late does not write a result for a test
+-- nobody is waiting on.
+local lateOne = loadModule(); setup(lateOne); lateOne.setAllowed(true)
+queued = {}
+lateOne.control({op = "play"})
+fakeNow += 200
+assert(lateOne.control({op = "stop"}).changed, "reaped")
+playResult = "stale result"
+queued[1]()
+playResult = nil
+assert(lateOne.control({op = "state"}).state.lastResult == nil, "a reaped launch's late result is dropped")
+deferLaunch = false
 print("playtests: defaults, persistence, guards, stop and queued-start lock pass")

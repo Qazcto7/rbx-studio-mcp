@@ -5,6 +5,8 @@ local writes, launches, stopped, left, ended = 0, {}, 0, 0, 0
 local running, runMode, clientContext = false, false, false
 local queued = {}
 local deferLaunch = false
+-- What a launch returns when it finally ends, i.e. what EndTest passed.
+local playResult = nil
 local task = {
  spawn = function(fn) if deferLaunch then table.insert(queued, fn) else fn() end end,
  delay = function(_, fn) fn() end,
@@ -21,7 +23,7 @@ local RunService = {
 local function launch(mode) table.insert(launches, mode); running = true; runMode = mode == "run" end
 local StudioTestService = {
  EditModeActive = true,
- ExecutePlayModeAsync = function() launch("play") end,
+ ExecutePlayModeAsync = function() launch("play"); return playResult end,
  ExecuteRunModeAsync = function() launch("run") end,
  ExecuteMultiplayerTestAsync = function() launch("multiplayer") end,
  EndTest = function() ended += 1; running = false end,

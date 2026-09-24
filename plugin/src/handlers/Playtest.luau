@@ -202,6 +202,13 @@ function Playtest.control(params: { [string]: any }): { [string]: any }
 			this for the first minute or so, and clearing it then would let a second
 			start pile onto a transition that is still under way, which is what
 			wedges Studio. So it must be old, and Studio must be sitting in edit mode.
+
+			"Sitting in edit mode" has to be KNOWN, not merely not contradicted.
+			`pending` also stays true for the whole of a healthy test (the Execute
+			call only returns when it ends), and the editor's `isRunning` is false
+			throughout one -- so when `EditModeActive` cannot be read, a test two
+			minutes into a normal run looked exactly like an abandoned start, and
+			clearing it let the next `play` start a second test on top of it.
 		]]
 		local reaped = false
 		if
@@ -209,10 +216,13 @@ function Playtest.control(params: { [string]: any }): { [string]: any }
 			and startedAt ~= nil
 			and os.clock() - startedAt >= STALE_PENDING_SECONDS
 			and not after.isRunning
-			and after.editModeActive ~= false
+			and after.editModeActive == true
 		then
 			pending = false
 			startedAt = nil
+			-- The abandoned launch may still return one day; bumping the generation
+			-- stops it writing a result for a test nobody is waiting on any more.
+			generation += 1
 			after = state()
 			reaped = true
 		end
@@ -231,7 +241,7 @@ function Playtest.control(params: { [string]: any }): { [string]: any }
 		Dispatch.fail(
 			"ALREADY_RUNNING",
 			string.format("A test start has been pending for %ds.", waited),
-			if waited >= STALE_PENDING_SECONDS and not before.isRunning and before.editModeActive ~= false
+			if waited >= STALE_PENDING_SECONDS and not before.isRunning and before.editModeActive == true
 				then "Studio is in edit mode and no test is running, so the start never returned. "
 					.. "Call op 'stop' to clear it, then start again."
 				else "Under Wine a start can take 30-90s: poll op 'state' rather than sending it again. "
