@@ -45,6 +45,7 @@ local Data = require(script.handlers.Data)
 local Anim = require(script.handlers.Anim)
 local Api = require(script.handlers.Api)
 local Scripts = require(script.handlers.Scripts)
+local Sync = require(script.handlers.Sync)
 local Session = require(script.handlers.Session)
 
 local SETTING_PORT = "port"
@@ -66,6 +67,9 @@ local SETTING_WIDGET_OPEN = "widgetOpen"
 ]]
 local SETTING_AUTO_OPEN = "autoOpen"
 local SETTING_PLAYTESTS = "playtestsEnabled"
+-- Whether sentences typed at the prompt are sent to an agent. Absent means off:
+-- it only turns on when the user runs `chat on`.
+local SETTING_CHAT = "chatEnabled"
 local SETTING_WIDGET_SIZE = "widgetSize"
 local SETTING_WIDGET_TRACE = "widgetTrace"
 
@@ -194,6 +198,7 @@ Audio.register()
 Exec.register()
 Viewport.register()
 Scripts.register()
+Sync.register()
 Input.register()
 Device.register()
 Data.register()
@@ -263,6 +268,8 @@ local wantOpen = if typeof(storedOpen) == "boolean" then storedOpen else true
 	left exactly as it was, so turning this back on restores the panel to however
 	it was last left rather than to a default.
 ]]
+local chat = plugin:GetSetting(SETTING_CHAT) == true
+
 local storedAutoOpen = plugin:GetSetting(SETTING_AUTO_OPEN)
 local autoOpen = if typeof(storedAutoOpen) == "boolean" then storedAutoOpen else true
 if not autoOpen then
@@ -400,10 +407,14 @@ local function trace(what: string)
 	end)
 end
 
--- Set once the plugin starts tearing down, so a widget that is collapsing with it
--- does not write its shrunken size over the one the user chose. (Read below as a
--- bare name before this existed, which Luau treats as a nil global: the guard was
--- always false and never guarded anything.)
+--[[
+	Set the moment the plugin starts to unload.
+
+	`persistSize` checked a variable of this name that was never declared, so it
+	read as nil and the guard never applied. A widget that is being torn down
+	reports whatever size it collapses through, and only the minimum-size check
+	stood between that and the saved layout.
+]]
 local unloading = false
 
 if RunService:IsEdit() then
@@ -558,11 +569,26 @@ Commands.setup({
 		autoOpen = value
 		plugin:SetSetting(SETTING_AUTO_OPEN, value)
 	end,
+	chat = function()
+		return chat
+	end,
+	saveChat = function(value)
+		chat = value
+		plugin:SetSetting(SETTING_CHAT, value)
+	end,
 	status = function()
 		return currentStatus
 	end,
 	studioId = studioId,
 })
+
+Console.setPromptChat(chat)
+
+-- Sync reports what it changed in the log; handed a function rather than the
+-- console itself, for the same reason `Commands` is.
+Sync.setup(function(level, message, detail)
+	Console.log(level :: any, message, detail)
+end)
 
 -- The saved preset, now that there is something to paint. Done immediately
 -- after mounting and before the first line is logged, so nothing is ever drawn
@@ -739,7 +765,30 @@ end
 	and any `*Async` call does -- and serialising them would let one slow edit
 	stall every other request on the stream.
 ]]
-local function onCommand(id: string, op: string, params: { [string]: any }?)
+--[[
+	Commands that run without a line in the log.
+
+	`sync watch` asks what changed twice a second for as long as it runs, and
+	`sync.log` exists to print a line of its own. Logging either call would bury
+	everything else the panel shows under a heartbeat nobody needs to see.
+]]
+local QUIET: { [string]: boolean } = {
+	["sync.changes"] = true,
+	["sync.log"] = true,
+	["sync.shape"] = true,
+	["sync.revisions"] = true,
+}
+
+local function onCommand(id: string, op: string, params: { [string]: any }?, deadlineMs: number?)
+	-- A sync op can also ask to be quiet: `watch` runs the same scans a manual
+	-- sync does, and logging each would print a heartbeat. What a watch
+	-- actually changes is still logged, by `sync.apply` and `sync.log`.
+	if QUIET[op] or (string.sub(op, 1, 5) == "sync." and params ~= nil and params.quiet == true) then
+		task.spawn(function()
+			Transport.sendResult(Dispatch.invoke(id, op, params, deadlineMs))
+		end)
+		return
+	end
 	task.spawn(function()
 		local startedAt = os.clock()
 		--[[
@@ -762,7 +811,7 @@ local function onCommand(id: string, op: string, params: { [string]: any }?)
 		]]
 		Console.beginCall(title, Phrase.kindOf(op))
 
-		local result = Dispatch.invoke(id, op, params)
+		local result = Dispatch.invoke(id, op, params, deadlineMs)
 		local milliseconds = (os.clock() - startedAt) * 1000
 
 		--[[

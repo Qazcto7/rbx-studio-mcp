@@ -69,6 +69,8 @@ local Dispatch = require(script.Parent.Parent.Dispatch)
 local Paths = require(script.Parent.Parent.Paths)
 local ClientRelay = require(script.Parent.Parent.ClientRelay)
 local RemoteTrace = require(script.Parent.Parent.RemoteTrace)
+local ScriptEdit = require(script.Parent.Parent.ScriptEdit)
+local TextEdit = require(script.Parent.Parent.TextEdit)
 
 -- Snapshots are far heavier than log lines: each carries a stack and its
 -- variables. A tight cap keeps a breakpoint inside a loop from exhausting memory
@@ -288,6 +290,9 @@ function Debug.set(params: { [string]: any }): { [string]: any }
 
 	local added: { { [string]: any } } = {}
 	local failed: { { [string]: any } } = {}
+	-- How many of `failed` were lines the script does not have, as opposed to
+	-- refusals from the debugger itself. See below.
+	local outside = 0
 
 	for _, item in requested :: { { [string]: any } } do
 		local target = Paths.resolve(item.path)
@@ -296,6 +301,31 @@ function Debug.set(params: { [string]: any }): { [string]: any }
 				"NOT_A_SCRIPT",
 				string.format("%s is a %s, not a script.", item.path, target.ClassName)
 			)
+		end
+
+		--[[
+			A line the script does not have is knowable here, so it is refused here.
+
+			It used to go to `AddBreakpoint` like any other, which refuses it with
+			nothing to say -- and the refusal below then blamed the "Debugger Luau
+			API" beta, so a mistyped line number sent people off to change a Studio
+			setting that was already on.
+		]]
+		local wanted = tonumber(item.line)
+		local lineCount = #TextEdit.toLines(ScriptEdit.read(target :: LuaSourceContainer))
+		if wanted == nil or wanted < 1 or wanted > lineCount then
+			outside += 1
+			table.insert(failed, {
+				path = item.path,
+				line = wanted,
+				error = string.format(
+					"the script has %d line%s, so line %s does not exist",
+					lineCount,
+					if lineCount == 1 then "" else "s",
+					tostring(item.line)
+				),
+			})
+			continue
 		end
 
 		--[[
@@ -372,6 +402,18 @@ function Debug.set(params: { [string]: any }): { [string]: any }
 		a user's script just to answer a status question. So the hint says what
 		to check first and what else it could be, and does not claim to know.
 	]]
+	if #added == 0 and outside > 0 and outside == #failed then
+		local reasons: { string } = {}
+		for _, entry in failed do
+			table.insert(reasons, string.format("%s: %s", tostring(entry.path), tostring(entry.error)))
+		end
+		Dispatch.fail(
+			"BAD_LINE",
+			string.format("No breakpoint was set: %s.", table.concat(reasons, "; ")),
+			"Read the script with `script_read` for its line numbers -- they shift after every edit."
+		)
+	end
+
 	if #added == 0 and #failed > 0 then
 		Dispatch.fail(
 			"NO_BREAKPOINTS_SET",
@@ -399,7 +441,7 @@ function Debug.clear(params: { [string]: any }): { [string]: any }
 			local ok, removed = pcall(function()
 				return service:RemoveBreakpoint(target, line)
 			end)
-			untrack(target, line)
+			if ok and removed == true then untrack(target, line) end
 			return { removed = ok and removed == true, path = Paths.of(target), line = line }
 		end
 
@@ -416,27 +458,29 @@ function Debug.clear(params: { [string]: any }): { [string]: any }
 		local removedLines: { number } = {}
 		if lines then
 			for lineNumber in lines do
-				local ok = pcall(function()
-					service:RemoveBreakpoint(target, lineNumber)
+				local ok, removed = pcall(function()
+					return service:RemoveBreakpoint(target, lineNumber)
 				end)
-				if ok then
+				if ok and removed == true then
 					table.insert(removedLines, lineNumber)
+					lines[lineNumber] = nil
 				end
 			end
-			trackedBreakpoints[target] = nil
+			if next(lines) == nil then trackedBreakpoints[target] = nil end
 		end
 		table.sort(removedLines)
 		return { removed = #removedLines > 0, path = Paths.of(target), lines = removedLines }
 	end
 
-	local ok, err = pcall(function()
-		service:ClearBreakpoints()
-	end)
-	if not ok then
-		Dispatch.fail("REFUSED", string.format("ClearBreakpoints refused: %s", tostring(err)))
+	-- Only remove MCP-owned breakpoints, preserving those set in Studio by users.
+	for target, lines in trackedBreakpoints do
+		for lineNumber in lines do
+			local ok, removed = pcall(function() return service:RemoveBreakpoint(target, lineNumber) end)
+			if ok and removed then lines[lineNumber] = nil end
+		end
+		if next(lines) == nil then trackedBreakpoints[target] = nil end
 	end
-	table.clear(trackedBreakpoints)
-	return { cleared = true }
+	return { cleared = next(trackedBreakpoints) == nil }
 end
 
 function Debug.snapshots(params: { [string]: any }): { [string]: any }
@@ -448,15 +492,16 @@ function Debug.snapshots(params: { [string]: any }): { [string]: any }
 		table.insert(out, snapshots[index])
 	end
 
+	local total, lost = #snapshots, overflow
 	if params.clear == true then
-		snapshots = {}
-		overflow = 0
+		for index = #snapshots, first, -1 do table.remove(snapshots, index) end
+		if #snapshots == 0 then overflow = 0 end
 	end
 
 	return {
 		items = out,
-		total = #snapshots,
-		overflow = if overflow > 0 then overflow else nil,
+		total = total,
+		overflow = if lost > 0 then lost else nil,
 		installed = installed,
 	}
 end

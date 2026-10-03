@@ -1,6 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * Live Roblox API reflection, sourced from the official API dump.
@@ -63,16 +63,21 @@ let classIndex: Map<string, ApiClass> | null = null;
 const propertyCache = new Map<string, PropertyInfo[]>();
 const restrictionCache = new Map<string, Map<string, PropertyRestriction>>();
 
+/** When the loaded dump is next due a refresh; 0 while none is loaded. */
+let refreshAt = 0;
+let refreshing = false;
+
 function cachePath(): string {
   return join(tmpdir(), "roblox-studio-mcp", "api-dump.json");
 }
 
-async function readCache(): Promise<{ dump: ApiDump; fresh: boolean } | null> {
+async function readCache(): Promise<{ dump: ApiDump; fetchedAt: number; fresh: boolean } | null> {
   try {
     const raw = await readFile(cachePath(), "utf8");
     const cached = JSON.parse(raw) as CacheFile;
     if (!Array.isArray(cached?.dump?.Classes)) return null;
-    return { dump: cached.dump, fresh: Date.now() - cached.fetchedAt <= CACHE_TTL_MS };
+    const fetchedAt = typeof cached.fetchedAt === "number" ? cached.fetchedAt : 0;
+    return { dump: cached.dump, fetchedAt, fresh: Date.now() - fetchedAt <= CACHE_TTL_MS };
   } catch {
     return null;
   }
@@ -95,12 +100,50 @@ async function download(): Promise<ApiDump | null> {
 const RETRY_AFTER_MS = 60_000;
 
 async function writeCache(dump: ApiDump): Promise<void> {
+  // Written beside the real file and renamed over it. Every server process on
+  // the machine shares this path, and one reading it mid-write saw a truncated
+  // document, which reads as "no cache" and costs a 2.4MB download.
+  const path = cachePath();
+  const staging = `${path}.${process.pid}.tmp`;
   try {
-    const path = cachePath();
-    await mkdir(join(path, ".."), { recursive: true });
-    await writeFile(path, JSON.stringify({ fetchedAt: Date.now(), dump }), "utf8");
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(staging, JSON.stringify({ fetchedAt: Date.now(), dump }), "utf8");
+    await rename(staging, path);
   } catch {
     // A read-only or full temp directory only costs us the cache, not the feature.
+    await rm(staging, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Downloads a newer dump and swaps it in for the one already serving calls.
+ *
+ * A server process lives as long as the MCP client that started it -- days, for
+ * an editor left open -- so a dump loaded at startup used to be the dump for the
+ * whole life of the process. The daily expiry only ever refreshed the copy on
+ * disk for the NEXT process, which meant a class or property added by a Roblox
+ * update was reported as a typo until somebody restarted their editor.
+ *
+ * Everything derived from the dump is dropped with it. Failing leaves the old
+ * one in place and tries again after a short wait, because an outdated dump is
+ * still far better than none.
+ */
+async function refresh(): Promise<void> {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    const fresh = await download();
+    if (fresh === null) {
+      refreshAt = Date.now() + RETRY_AFTER_MS;
+      return;
+    }
+    classIndex = null;
+    propertyCache.clear();
+    restrictionCache.clear();
+    loaded = Promise.resolve(fresh);
+    refreshAt = Date.now() + CACHE_TTL_MS;
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -112,17 +155,21 @@ async function writeCache(dump: ApiDump): Promise<void> {
  * instance rather than refusing to answer.
  */
 export function loadApiDump(): Promise<ApiDump | null> {
+  if (refreshAt !== 0 && Date.now() >= refreshAt) void refresh();
+
   loaded ??= (async () => {
     //[[ A stale cache is served at once and refreshed behind the call.
     //
     // Engine APIs change slowly, and the refresh used to sit in the path of
     // whichever tool call first needed the dump after the daily expiry: a
     // 2.4MB download, up to 15s on a slow network, billed to one `create`.
-    // The fresh copy lands on disk for the next process.
+    // The fresh copy is swapped in when it arrives, and lands on disk for the
+    // next process.
     //]]
     const cached = await readCache();
     if (cached) {
-      if (!cached.fresh) void download();
+      refreshAt = cached.fetchedAt + CACHE_TTL_MS;
+      if (!cached.fresh) void refresh();
       return cached.dump;
     }
 
@@ -133,6 +180,8 @@ export function loadApiDump(): Promise<ApiDump | null> {
       setTimeout(() => {
         loaded = null;
       }, RETRY_AFTER_MS).unref();
+    } else {
+      refreshAt = Date.now() + CACHE_TTL_MS;
     }
     return dump;
   })();
@@ -308,6 +357,84 @@ export async function propertiesOf(className: string): Promise<PropertyInfo[]> {
   return properties;
 }
 
+/** Handled by the build spec itself, never as a property. */
+const STRUCTURAL = new Set(["Name", "Parent", "ClassName", "Archivable"]);
+
+/**
+ * Values that restate another property, and runtime state that is not part of
+ * what was built. A build file holding both halves of a pair lets an edit to
+ * one be overwritten by the other -- `BrickColor` applied after `Color` snaps
+ * the colour to the nearest brick colour -- so only the real half is kept.
+ */
+const DERIVED = new Set([
+  "BrickColor", // Color
+  "Rotation", // CFrame
+  "Axis", // Attachment.CFrame
+  "SecondaryAxis",
+  "WorldAxis",
+  "WorldSecondaryAxis",
+  "WorldCFrame",
+  "AssemblyLinearVelocity", // physics state
+  "AssemblyAngularVelocity",
+  "Jump", // Humanoid state
+  "Sit",
+  "PlatformStand",
+  "TargetPoint",
+  "WalkToPart",
+  "WalkToPoint",
+  "ColorMap", // Decal.Texture
+  "ColorMapContent",
+]);
+
+/**
+ * Properties worth writing into a build file: writable at plugin identity,
+ * scriptable, not deprecated, and not derived from another property.
+ *
+ * `Hidden` is what marks the derived ones -- `BasePart.Position` and
+ * `Orientation` restate `CFrame`, and the legacy `Font` restates `FontFace`.
+ * The dump's "saved" flag looks like the better signal and is not: `Size`,
+ * `Color`, `UICorner.CornerRadius` and `WeldConstraint.Part0` are all marked
+ * unsaved, because the file keeps them under an internal twin, and filtering
+ * on it rebuilt every part at the default size.
+ */
+export async function buildableProperties(className: string): Promise<PropertyInfo[]> {
+  const byName = await classesByName();
+  if (!byName) return [];
+  const properties: PropertyInfo[] = [];
+  const seen = new Set<string>();
+  let current = byName.get(className);
+  while (current) {
+    for (const member of current.Members) {
+      if (member.MemberType !== "Property" || seen.has(member.Name)) continue;
+      seen.add(member.Name);
+      const tags = member.Tags ?? [];
+      const security = securityOf(member);
+      if (
+        STRUCTURAL.has(member.Name) ||
+        !PLUGIN_REACHABLE.has(security.read) ||
+        !PLUGIN_REACHABLE.has(security.write) ||
+        tags.includes("NotScriptable") ||
+        tags.includes("ReadOnly") ||
+        tags.includes("Deprecated") ||
+        tags.includes("Hidden") ||
+        DERIVED.has(member.Name)
+      ) {
+        continue;
+      }
+      properties.push({
+        name: member.Name,
+        valueType: member.ValueType?.Name ?? "unknown",
+        category: member.ValueType?.Category ?? "unknown",
+        declaredBy: current.Name,
+        readOnly: false,
+        deprecated: false,
+      });
+    }
+    current = current.Superclass ? byName.get(current.Superclass) : undefined;
+  }
+  return properties;
+}
+
 /** Bases that describe every instance and so distinguish none of them. */
 const GENERIC_BASES = new Set(["Instance", "PVInstance"]);
 
@@ -328,7 +455,6 @@ const PRIORITY_PROPERTIES = [
   "Position",
   "CFrame",
   "Orientation",
-  "Rotation",
   "Anchored",
   "CanCollide",
   "Transparency",
@@ -351,6 +477,27 @@ const PRIORITY_PROPERTIES = [
   "PrimaryPart",
   "RunContext",
 ];
+
+/**
+ * Left out of `standard` although the dump offers them, because they were
+ * filling slots on every part while answering nothing: `Rotation` restates
+ * `Orientation` in the older axis order, the six surface types are legacy
+ * studs-and-inlets data, and assembly velocities read 0 on anything anchored
+ * (`inspect physics=true` is where motion belongs). `full` still has them all.
+ */
+const STANDARD_NOISE = new Set([
+  "Rotation",
+  "AssemblyLinearVelocity",
+  "AssemblyAngularVelocity",
+  "AudioCanCollide",
+  "LocalTransparencyModifier",
+  "BackSurface",
+  "BottomSurface",
+  "FrontSurface",
+  "LeftSurface",
+  "RightSurface",
+  "TopSurface",
+]);
 
 /** Sorts priority names first (in listed order), leaving the rest untouched. */
 function rankProperties(names: string[]): string[] {
@@ -381,7 +528,10 @@ export async function standardProperties(className: string): Promise<string[]> {
 
   const useful = all.filter(
     (property) =>
-      !GENERIC_BASES.has(property.declaredBy) && !property.deprecated && !property.readOnly,
+      !GENERIC_BASES.has(property.declaredBy) &&
+      !property.deprecated &&
+      !property.readOnly &&
+      !STANDARD_NOISE.has(property.name),
   );
 
   // Classes that add nothing of their own (Folder, Model) fall back to the full
@@ -391,12 +541,6 @@ export async function standardProperties(className: string): Promise<string[]> {
   const ranked = rankProperties(chosen.map((property) => property.name));
   const names = ranked.slice(0, STANDARD_LIMIT);
   return ["Name", ...names.filter((name) => name !== "Name")];
-}
-
-/** True when the dump knows this class. False also covers "dump unavailable". */
-export async function isKnownClass(className: string): Promise<boolean> {
-  const dump = await loadApiDump();
-  return dump?.Classes.some((entry) => entry.Name === className) ?? false;
 }
 
 /**

@@ -67,6 +67,40 @@ local function childrenByName(parent: Instance, memo: NameIndex?): { [string]: {
 		table.insert(list, child)
 	end
 
+	--[[
+		Same-named siblings put into a fixed order.
+
+		`GetChildren` does not return a stable order (see `stableOrder` in
+		Discover), so `Part[2]` could name a different part on the call that
+		reads the path back than on the one that printed it. The engine's debug
+		id is fixed for an instance's lifetime, which makes it the tiebreak.
+
+		Guarded, because this module also runs in the client relay, where
+		`GetDebugId` is not callable -- there the order is simply the engine's,
+		as it always was, rather than an error on every path.
+	]]
+	for _, list in byName do
+		if #list > 1 then
+			local ids: { [Instance]: string } = {}
+			local stable = true
+			for _, child in list do
+				local ok, id = pcall(function()
+					return child:GetDebugId()
+				end)
+				if not ok then
+					stable = false
+					break
+				end
+				ids[child] = id
+			end
+			if stable then
+				table.sort(list, function(a: Instance, b: Instance): boolean
+					return ids[a] < ids[b]
+				end)
+			end
+		end
+	end
+
 	if memo then
 		memo[parent] = byName
 	end
@@ -315,6 +349,14 @@ end
 	The index is positional, so it shifts if same-named siblings are inserted or
 	removed between calls. Read a fresh path after any structural change.
 ]]
+--[[
+	The position among same-named siblings, or nil when the name is unique --
+	the `n` in `Name[n]`. Exposed for `sync`, which names files after it.
+]]
+function Paths.ordinal(instance: Instance, memo: NameIndex?): number?
+	return siblingIndex(instance, memo)
+end
+
 function Paths.of(instance: Instance, memo: NameIndex?): string
 	--[[
 		Refuses anything that is not an Instance, rather than duck-typing it.

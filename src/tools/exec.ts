@@ -18,6 +18,10 @@ interface ExecResponse {
   milliseconds: number;
   /** Present only when how the code ran limited what it could do. */
   note?: string;
+  /** Printed lines left out by the output budget. */
+  outputDropped?: number;
+  /** Return values past the tenth. */
+  returnsDropped?: number;
 }
 
 interface UiAuditResponse {
@@ -240,6 +244,9 @@ export function registerExecTools(context: ToolContext): void {
       }
 
       if (response.note) parts.push(`Note: ${response.note}`);
+      // Said, so a short output is not read as everything the code printed.
+      if (response.outputDropped) parts.push(`[${response.outputDropped} more printed lines left out; print less, or return a summary]`);
+      if (response.returnsDropped) parts.push(`[${response.returnsDropped} more return values left out]`);
       /*
        * The client relay dies with the call, and so does everything it started.
        * Said whenever the source spawns something and no settle time was asked

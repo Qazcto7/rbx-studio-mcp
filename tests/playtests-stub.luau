@@ -1,7 +1,7 @@
 local stored = nil
 local fakeNow = 0
 local os = setmetatable({ clock = function() return fakeNow end }, { __index = os })
-local writes, launches, stopped, left, ended = 0, {}, 0, 0, 0
+local writes, launches, stopped, left, ended, added = 0, {}, 0, 0, 0, 0
 local running, runMode, clientContext = false, false, false
 local queued = {}
 local deferLaunch = false
@@ -28,6 +28,7 @@ local StudioTestService = {
  ExecuteMultiplayerTestAsync = function() launch("multiplayer") end,
  EndTest = function() ended += 1; running = false end,
  LeaveTest = function() left += 1; running = false end,
+ AddPlayers = function(_, count) added += count end,
 }
 local game = { GetService = function(_, name)
  if name == "RunService" then return RunService end
@@ -40,9 +41,11 @@ local function setup(module)
 end
 local rows = {}
 local requests = {}
+local promptChat = nil
 local Console = {
  log = function(level, message, detail) table.insert(rows, {level = level, message = message, detail = detail}) end,
  setPromptBusy = function() end,
+ setPromptChat = function(enabled) promptChat = enabled end,
 }
 local Secret = {mask = function(line) return line, false end}
 local Net = {

@@ -180,7 +180,7 @@ async function assertCreatable(className: string): Promise<void> {
 }
 
 /** Recursive create spec. Typed loosely because zod cannot infer the recursion. */
-interface CreateSpec {
+export interface CreateSpec {
   parent?: string;
   className: string;
   name?: string;
@@ -230,7 +230,7 @@ const createSpec = createNode.extend({
 });
 
 /** Checks the whole tree, naming the exact field that is wrong. */
-function parseCreateTree(instances: unknown): CreateSpec[] {
+export function parseCreateTree(instances: unknown): CreateSpec[] {
   const checked = z.array(createTree).safeParse(instances);
   if (checked.success) return checked.data;
   const issue = checked.error.issues[0];
@@ -246,7 +246,7 @@ function parseCreateTree(instances: unknown): CreateSpec[] {
 }
 
 /** Walks the create tree, replacing each property bag with typed specs. */
-async function typeCreateSpec(spec: CreateSpec, where: string): Promise<unknown> {
+export async function typeCreateSpec(spec: CreateSpec, where: string): Promise<unknown> {
   await assertCreatable(spec.className);
   return {
     parent: spec.parent,
@@ -400,7 +400,9 @@ export function registerInstanceTools(context: ToolContext): void {
           // not the agent asking to inspect anything — see discover.ts for
           // why the console needs to be told apart the two.
           {
-            paths: args.targets.flatMap((target) => target.paths),
+            // Each path once: several entries commonly name the same instance,
+            // and every duplicate is a resolve and a serialise in Studio.
+            paths: [...new Set(args.targets.flatMap((target) => target.paths))],
             includeChildren: false,
             probeOnly: true,
           },

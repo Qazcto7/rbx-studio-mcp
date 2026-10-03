@@ -1,7 +1,7 @@
 {
   "name": "@el4cteo/rbx-studio-mcp",
-  "version": "0.8.0",
-  "description": "MCP server for Roblox Studio. 35 tools, push-based SSE bridge, editor-safe script edits, one-step undo.",
+  "version": "0.8.6",
+  "description": "MCP server for Roblox Studio. 36 tools, push-based SSE bridge, two-way script sync with files, editor-safe script edits, one-step undo.",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -24,14 +24,14 @@
     "node": ">=22.15"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "watch": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
     "build:plugin": "node scripts/check-plugin.mjs && node scripts/build-plugin.mjs",
     "sourcemap": "node scripts/sourcemap.mjs",
     "test:live": "node scripts/test-live.mjs",
-    "test": "node scripts/check-plugin.mjs && node scripts/test-plugin.mjs && node scripts/test-input-relay.mjs && node scripts/test-capture-relay.mjs && node scripts/test-anim-play-relay.mjs && node scripts/test-plugin-dirs.mjs && node scripts/test-transport.mjs && node scripts/test-server.mjs && node scripts/test-bridge.mjs && node scripts/test-console.mjs && node scripts/test-failover.mjs && node scripts/test-tools.mjs && node scripts/test-doctor.mjs",
+    "test": "node scripts/check-plugin.mjs && node scripts/test-plugin.mjs && node scripts/test-input-relay.mjs && node scripts/test-capture-relay.mjs && node scripts/test-anim-play-relay.mjs && node scripts/test-plugin-dirs.mjs && node scripts/test-transport.mjs && node scripts/test-server.mjs && node scripts/test-bridge.mjs && node scripts/test-console.mjs && node scripts/test-failover.mjs && node scripts/test-tools.mjs && node scripts/test-doctor.mjs && node scripts/test-results.mjs && node scripts/test-sync.mjs && node scripts/test-sync-more.mjs && node scripts/test-apidump.mjs",
     "build:all": "npm run build && npm run build:plugin",
     "install:plugin": "node scripts/install-plugin.mjs",
     "check:plugin": "node scripts/check-plugin.mjs",
@@ -53,11 +53,11 @@
     "ai-agent"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
+    "@types/node": "^26.6.3",
     "typescript": "^7.0.2"
   },
   "author": "EL4CTEO",

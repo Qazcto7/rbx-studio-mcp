@@ -9,9 +9,10 @@
 	saved. Reads use the editor buffer for the same reason: handing an agent stale
 	source makes it "fix" changes the user just made.
 
-	Edits are also wrapped in a single `Undo` recording, so a batch across ten
-	scripts is one Ctrl+Z, and a batch that fails half way is rolled back rather
-	than left half applied.
+	Source undo is the script editor's own, per script -- a ChangeHistoryService
+	recording cannot capture an editor write. What a batch gets instead is
+	all-or-nothing application (see `edit`) and the shared mutation lock, so two
+	batches never interleave their writes.
 
 	The text manipulation itself lives in `TextEdit`, which has no Roblox
 	dependencies and is unit tested.
@@ -56,43 +57,6 @@ local function resolveScript(path: string): LuaSourceContainer
 	return instance :: LuaSourceContainer
 end
 
---[[
-	A short fingerprint of a script's source, for detecting that it moved.
-
-	Handed out by `read` and passed back to `edit`, which refuses to write when
-	the live source no longer matches. That is the only thing standing between
-	two agents on one place and a silent overwrite: a line-range edit computed
-	against source somebody has since changed still applies cleanly, it just
-	applies to the wrong lines, and nothing anywhere reports it.
-
-	FNV-1a over the whole string, with the length appended. Not a security
-	hash and does not need to be -- it is guarding against ordinary concurrent
-	editing, not against someone constructing a collision. The length is there
-	because it is free and rules out the whole class of same-length accidents.
-
-	The multiply is split into 16-bit halves on purpose. `hash * 16777619` with
-	a 32-bit hash reaches 2^56, past the 2^53 where doubles stop being exact,
-	so the low bits -- the ones that carry the mixing -- would be quietly
-	rounded away.
-]]
-local function fingerprint(source: string): string
-	local hash = 2166136261
-	local length = #source
-	local index = 1
-	while index <= length do
-		local last = math.min(index + 511, length)
-		local chunk = { string.byte(source, index, last) }
-		for _, byte in chunk do
-			hash = bit32.bxor(hash, byte)
-			local low = bit32.band(hash, 0xFFFF)
-			local high = bit32.rshift(hash, 16)
-			-- 16777619 == 0x01000193, so 0x0193 is 403 and 0x0100 is 256.
-			hash = bit32.band(low * 403 + bit32.lshift(bit32.band(high * 403 + low * 256, 0xFFFF), 16), 0xFFFFFFFF)
-		end
-		index = last + 1
-	end
-	return string.format("%08x-%x", hash, length)
-end
 
 --[[
 	Whether a script is really the source of truth, or a copy of a file on disk.
@@ -197,7 +161,7 @@ function Scripts.read(params: { [string]: any }): { [string]: any }
 			-- Of the whole file, never of the window: `edit` compares it against
 			-- the live source, and a fingerprint of forty lines out of four
 			-- hundred would call an edit safe that it is not.
-			revision = fingerprint(whole),
+			revision = ScriptEdit.revisionOf(target, whole),
 			-- Absent unless the script is bound to a file on disk, in which case
 			-- editing it here is a race against whatever writes that file.
 			fileSync = syncedFile(target),
@@ -222,8 +186,14 @@ end
 	Phase two writes the finished text. If a write fails there -- realistically
 	only a locked or package-owned script -- the scripts already written are
 	restored from the source captured in phase one.
+
+	Phase one reads, phase two writes, and the editor yields in between, so the
+	user can type into a script after it was read. Each write therefore checks,
+	inside the editor's own callback, that the text is still what phase one
+	transformed, and a restore only puts back text that is still ours. Anything
+	newer is kept and named, rather than silently overwritten on either path.
 ]]
-function Scripts.edit(params: { [string]: any }): { [string]: any }
+local function editBatch(params: { [string]: any }): { [string]: any }
 	local edits = params.edits
 	if typeof(edits) ~= "table" or #edits == 0 then
 		Dispatch.fail(
@@ -272,7 +242,7 @@ function Scripts.edit(params: { [string]: any }): { [string]: any }
 			if typeof(stated) ~= "string" or stated == "" then
 				continue
 			end
-			live = live or fingerprint(before)
+			live = live or ScriptEdit.revisionOf(target, before)
 			if stated ~= live then
 				Dispatch.fail(
 					"STALE_SCRIPT",
@@ -293,35 +263,79 @@ function Scripts.edit(params: { [string]: any }): { [string]: any }
 		table.insert(pending, { target = target, before = before, after = after })
 	end
 
-	-- Phase two: write. `written` is the compensation log for a mid-batch failure.
+	-- Phase two: write. `written` is the compensation log for a mid-batch
+	-- failure, and holds every script whose write reached the editor -- a write
+	-- whose confirmation failed afterwards has still changed the script.
 	local written: { Pending } = {}
 	local memo: Paths.NameIndex = {}
 	local results: { { [string]: any } } = {}
 
 	for _, entry in pending do
+		local committed = false
 		-- Wrapped in a closure rather than passed to pcall directly: `write`
 		-- returns nothing, and pcall's typed signature expects a value back.
 		local ok, err = pcall(function()
-			ScriptEdit.write(entry.target, function()
+			ScriptEdit.write(entry.target, function(current)
+				if current ~= entry.before then
+					Dispatch.fail(
+						"STALE_SCRIPT",
+						string.format("%s changed while this batch was being written.", entry.target:GetFullName()),
+						"Somebody typed into it after it was read. Read it again with "
+							.. "script_read and rebuild the edit against what is there now."
+					)
+				end
+				committed = entry.after ~= entry.before
 				return entry.after
 			end)
 		end)
+		if committed then
+			table.insert(written, entry)
+		end
 
 		if not ok then
+			local kept: { string } = {}
 			for index = #written, 1, -1 do
 				local done = written[index]
-				-- Best effort: a restore that fails leaves that script edited, and
-				-- the original error still describes what actually went wrong.
-				pcall(function()
-					ScriptEdit.write(done.target, function()
-						return done.before
+				-- Nothing to undo when the editor never took the write -- and a
+				-- write it refused (a locked script) would only be refused again.
+				if ScriptEdit.read(done.target) == done.before then
+					continue
+				end
+				local restored, restoreError = pcall(function()
+					ScriptEdit.write(done.target, function(current)
+						if current == done.after then
+							return done.before
+						end
+						if current ~= done.before then
+							Dispatch.fail("ROLLBACK_CONFLICT", "edited again since this batch wrote it; that text was kept")
+						end
+						return current
 					end)
 				end)
+				if not restored then
+					local reason = if typeof(restoreError) == "table" then restoreError.message else tostring(restoreError)
+					table.insert(kept, string.format("%s (%s)", done.target:GetFullName(), tostring(reason)))
+				end
+			end
+			--[[
+				Said outright when the rollback could not finish.
+
+				The batch promises all-or-nothing, and a restore that fails leaves
+				part of it applied. Reporting only the original error would let the
+				agent believe nothing changed and retry on top of a half-applied edit.
+			]]
+			if #kept > 0 then
+				local reason = if typeof(err) == "table" then err.message else tostring(err)
+				Dispatch.fail(
+					"PARTIAL_EDIT",
+					string.format("%s The batch could not be fully rolled back.", tostring(reason)),
+					"Still edited, left as they are: " .. table.concat(kept, "; ")
+						.. ". Read these scripts before retrying."
+				)
 			end
 			error(err, 0)
 		end
 
-		table.insert(written, entry)
 		table.insert(results, {
 			path = Paths.of(entry.target, memo),
 			className = entry.target.ClassName,
@@ -331,46 +345,101 @@ function Scripts.edit(params: { [string]: any }): { [string]: any }
 			-- Of what is there now, not of what was asked for: the editor can
 			-- normalise the text it is handed, and a rev that does not match the
 			-- live buffer would refuse the very next edit as stale.
-			rev = fingerprint(ScriptEdit.read(entry.target)),
+			rev = ScriptEdit.revisionOf(entry.target),
 		})
 	end
 
 	return { items = results }
 end
 
+function Scripts.edit(params: { [string]: any }): { [string]: any }
+	return Undo.exclusive(function()
+		return editBatch(params)
+	end)
+end
+
 --[[
 	Searches script source. Matches come from the editor buffer, so text the user
 	has typed but not saved is found too -- which is the state an agent about to
 	edit the file actually needs to see.
+
+	`patterns` takes up to 16 literal needles searched in one pass. Looking for
+	every caller of three functions used to be three calls, each reading every
+	script's buffer again; the reads are the cost, not the matching.
+
+	`mode` picks what comes back: matching lines (the default), one row per
+	matching script, or only per-needle counts of matching lines -- the cheap
+	way to ask "how widespread is this" before deciding to read anything.
 ]]
+local GREP_MAX_NEEDLES = 16
+-- Characters of rows handed back, estimated per row. The server clips to its
+-- own response limit as well; this keeps a search over long minified lines from
+-- building a reply far past it only for most of it to be thrown away.
+local GREP_BUDGET = 18_000
+local GREP_LONG_LINE = 256
+
 function Scripts.grep(params: { [string]: any }): { [string]: any }
-	local pattern = params.pattern
-	if typeof(pattern) ~= "string" or pattern == "" then
-		Dispatch.fail("BAD_PARAMS", "script_grep requires a `pattern`.")
+	local needles: { string } = {}
+	local literal = params.literal == true
+	local patterns = params.patterns
+	if patterns ~= nil then
+		if params.pattern ~= nil or typeof(patterns) ~= "table" or #patterns == 0 or #patterns > GREP_MAX_NEEDLES then
+			Dispatch.fail(
+				"BAD_PARAMS",
+				string.format("Pass either `pattern` or 1-%d `patterns`, not both.", GREP_MAX_NEEDLES)
+			)
+		end
+		-- Always literal: the point is identifiers, and mixing Lua patterns into a
+		-- batch makes one bad escape fail every needle with it.
+		literal = true
+		for _, needle in patterns do
+			if typeof(needle) ~= "string" or needle == "" then
+				Dispatch.fail("BAD_PARAMS", "Every entry in `patterns` must be a non-empty string.")
+			end
+			table.insert(needles, needle)
+		end
+	elseif typeof(params.pattern) == "string" and params.pattern ~= "" then
+		table.insert(needles, params.pattern)
+	else
+		Dispatch.fail("BAD_PARAMS", "script_grep requires a `pattern` or `patterns`.")
+	end
+
+	local mode = params.mode or "lines"
+	if mode ~= "lines" and mode ~= "files" and mode ~= "counts" then
+		Dispatch.fail("BAD_PARAMS", string.format("%q is not a grep mode.", tostring(mode)), "Use lines, files or counts.")
 	end
 
 	local root = if params.path then Paths.resolve(params.path) else game
-	local literal = params.literal == true
 	local ignoreCase = params.ignoreCase == true
 	local contextLines = math.clamp(tonumber(params.contextLines) or DEFAULT_CONTEXT, 0, 10)
-	local limit = math.min(tonumber(params.limit) or 100, MAX_MATCHES)
-	local offset = tonumber(params.offset) or 0
+	local limit = math.clamp(tonumber(params.limit) or 100, 1, MAX_MATCHES)
+	local offset = math.max(0, tonumber(params.offset) or 0)
 	local classFilter = params.className
 
-	local needle = if ignoreCase then string.lower(pattern) else pattern
+	if ignoreCase then
+		for index, needle in needles do
+			needles[index] = string.lower(needle)
+		end
+	end
 
 	local targets: { LuaSourceContainer } = {}
-	for _, instance in root:GetDescendants() do
+	local function consider(instance: Instance)
 		if not instance:IsA("LuaSourceContainer") then
-			continue
+			return
 		end
 		if root == game and Scope.isNoisy(instance) then
-			continue
+			return
 		end
 		if classFilter and not instance:IsA(classFilter) then
-			continue
+			return
 		end
-		table.insert(targets, instance)
+		table.insert(targets, instance :: LuaSourceContainer)
+	end
+	-- The root itself counts: `path` naming one script searches that script,
+	-- where it used to search only its (usually absent) children.
+	consider(root)
+	for _, instance in root:GetDescendants() do
+		consider(instance)
 	end
 
 	if #targets > MAX_SCRIPTS then
@@ -381,13 +450,49 @@ function Scripts.grep(params: { [string]: any }): { [string]: any }
 		)
 	end
 
-	local function badPattern(reason: any): never
+	--[[
+		A fixed order, so `offset` means the same thing on every page.
+
+		`GetDescendants` does not return one (see `stableOrder` in Discover): page
+		two came from a different ordering than page one, repeating some matches
+		and silently skipping others. By full name, with the debug id separating
+		same-named scripts.
+	]]
+	local keys: { [Instance]: string } = {}
+	for _, target in targets do
+		local ok, id = pcall(function()
+			return target:GetDebugId()
+		end)
+		keys[target] = target:GetFullName() .. "\0" .. (if ok then id else "")
+	end
+	table.sort(targets, function(a: Instance, b: Instance): boolean
+		return keys[a] < keys[b]
+	end)
+
+	local function badPattern(needle: string, reason: any): never
 		Dispatch.fail(
 			"BAD_PATTERN",
-			string.format("%s is not a valid Lua pattern: %s", pattern, tostring(reason)),
+			string.format("%s is not a valid Lua pattern: %s", needle, tostring(reason)),
 			"Lua patterns escape with %, not backslash, and have no alternation. "
 				.. "Set `literal` to search for the text exactly as written."
 		)
+	end
+
+	-- Which needles occur on `text`, or nil. An invalid Lua pattern raises rather
+	-- than simply not matching, so it is reported as a pattern problem.
+	local function hits(text: string): { number }?
+		local found: { number }? = nil
+		for index, needle in needles do
+			local ok, from = pcall(string.find, text, needle, 1, literal)
+			if not ok then
+				badPattern(needle, from)
+			end
+			if from then
+				found = found or {}
+				table.insert(found :: { number }, index)
+			end
+		end
+		return found
 	end
 
 	--[[
@@ -401,53 +506,80 @@ function Scripts.grep(params: { [string]: any }): { [string]: any }
 	]]
 	-- Any trailing `$` counts, escaped or not: skipping the shortcut costs speed,
 	-- taking it wrongly would hide matches.
-	local anchored = not literal and (string.sub(needle, 1, 1) == "^" or string.sub(needle, -1) == "$")
+	local anchored = false
+	if not literal then
+		for _, needle in needles do
+			if string.sub(needle, 1, 1) == "^" or string.sub(needle, -1) == "$" then
+				anchored = true
+			end
+		end
+	end
 
 	local matches: { { [string]: any } } = {}
+	local counts: { number } = table.create(#needles, 0)
 	local total = 0
+	local matchedFiles = 0
+	local budget = GREP_BUDGET
+	local full = false
 	local memo: Paths.NameIndex = {}
+
+	-- Rows stop at `limit` or the budget, whichever comes first; `total` keeps
+	-- counting either way, so the cursor the server builds from the rows actually
+	-- shown picks up exactly where this reply stopped.
+	local function emit(entry: { [string]: any }, cost: number): boolean
+		if full or #matches >= limit then
+			return false
+		end
+		if cost > budget and #matches > 0 then
+			full = true
+			return false
+		end
+		budget -= cost
+		table.insert(matches, entry)
+		return true
+	end
 
 	for _, target in targets do
 		local source = ScriptEdit.read(target)
-		if not anchored then
-			local ok, found = pcall(string.find, if ignoreCase then string.lower(source) else source, needle, 1, literal)
-			if not ok then
-				badPattern(found)
-			end
-			if not found then
-				continue
-			end
+		local searchable = if ignoreCase then string.lower(source) else source
+		if not anchored and hits(searchable) == nil then
+			continue
 		end
 
 		local lines = TextEdit.toLines(source)
 		local path: string? = nil
+		local revision: string? = nil
+		local fileMatches = 0
 
 		for number, line in lines do
-			local haystack = if ignoreCase then string.lower(line) else line
-			-- An invalid Lua pattern raises rather than simply not matching, so it
-			-- has to be caught and reported as a pattern problem, not a no-match.
-			local ok, from = pcall(string.find, haystack, needle, 1, literal)
-			if not ok then
-				badPattern(from)
+			local found = hits(if ignoreCase then string.lower(line) else line)
+			if found == nil then
+				continue
 			end
-			if not from then
+			fileMatches += 1
+			for _, index in found do
+				counts[index] += 1
+			end
+			if mode ~= "lines" then
 				continue
 			end
 
 			total += 1
-			if total <= offset or #matches >= limit then
+			if total <= offset or full or #matches >= limit then
 				continue
 			end
 
-			if not path then
-				path = Paths.of(target, memo)
-			end
-
+			path = path or Paths.of(target, memo)
+			revision = revision or ScriptEdit.revisionOf(target, source)
 			local entry: { [string]: any } = {
 				path = path,
+				revision = revision,
 				line = number,
 				text = line,
+				-- Only when there is more than one needle to tell apart.
+				needles = if #needles > 1 then found else nil,
 			}
+			local cost = #line + 80
 			if contextLines > 0 then
 				local before: { string } = {}
 				local after: { string } = {}
@@ -455,8 +587,38 @@ function Scripts.grep(params: { [string]: any }): { [string]: any }
 				table.move(lines, number + 1, math.min(number + contextLines, #lines), 1, after)
 				entry.before = before
 				entry.after = after
+				for _, text in before do
+					cost += #text + 4
+				end
+				for _, text in after do
+					cost += #text + 4
+				end
 			end
-			table.insert(matches, entry)
+			-- A single line longer than the whole budget -- minified or generated
+			-- code -- is cut rather than never shown, which would stall the cursor.
+			if cost > budget and #matches == 0 then
+				entry.before, entry.after = nil, nil
+				entry.text = string.sub(line, 1, GREP_LONG_LINE)
+				entry.truncated = true
+				cost = GREP_LONG_LINE + 80
+			end
+			emit(entry, cost)
+		end
+
+		if fileMatches > 0 then
+			matchedFiles += 1
+			if mode == "files" then
+				total += 1
+				if total > offset then
+					path = path or Paths.of(target, memo)
+					emit({
+						path = path,
+						className = target.ClassName,
+						revision = ScriptEdit.revisionOf(target, source),
+						matches = fileMatches,
+					}, #(path :: string) + 60)
+				end
+			end
 		end
 	end
 
@@ -465,6 +627,8 @@ function Scripts.grep(params: { [string]: any }): { [string]: any }
 		total = total,
 		offset = offset,
 		searched = #targets,
+		counts = if mode == "counts" then counts else nil,
+		matchedFiles = if mode == "counts" then matchedFiles else nil,
 	}
 end
 
@@ -648,10 +812,30 @@ function Scripts.create(params: { [string]: any }): { [string]: any }
 
 	-- After the recording, because the editor write yields. Undoing the create
 	-- still removes these scripts whole, source and all.
+	--
+	-- The scripts already exist at this point, so a failed write is reported as
+	-- what it is -- created, but without their source -- instead of as a failed
+	-- create an agent would retry into duplicates. And the write only fills a
+	-- script that is still empty: anything else is somebody else's text.
 	for _, entry in oversized do
-		ScriptEdit.write(entry.target, function()
-			return entry.source
+		local ok, err = pcall(function()
+			Undo.exclusive(function()
+				ScriptEdit.write(entry.target, function(current)
+					if current ~= "" then
+						Dispatch.fail("STALE_SCRIPT", "edited before its source could be written; that text was kept")
+					end
+					return entry.source
+				end)
+			end)
 		end)
+		if not ok then
+			local reason = if typeof(err) == "table" then err.message else tostring(err)
+			Dispatch.fail(
+				"PARTIAL_CREATE",
+				string.format("%s was created, but its source was not written: %s", Paths.of(entry.target), tostring(reason)),
+				"The script exists. Read it and write the source with script_edit rather than creating it again."
+			)
+		end
 	end
 
 	return {

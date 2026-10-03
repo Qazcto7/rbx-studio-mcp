@@ -4,6 +4,12 @@ import { defineTool, type ToolContext } from "../lib/tool.js";
 
 interface ConsoleResponse {
   items: Array<{
+    /** Set when a late stack trace re-delivered an entry already read. */
+    updated?: boolean;
+    /** With `group`: how many identical entries this row stands for. */
+    count?: number;
+    firstTimestamp?: number;
+    lastTimestamp?: number;
     level: string;
     message: string;
     timestamp?: number;
@@ -11,6 +17,8 @@ interface ConsoleResponse {
     stack?: string;
     /** Script the error came from, as a full path. */
     source?: string;
+    /** A structured log's context table, as JSON. */
+    context?: string;
   }>;
   total: number;
   dropped: number;
@@ -19,6 +27,8 @@ interface ConsoleResponse {
   /** How long this session has been recording. Disambiguates an empty log. */
   recordingSeconds?: number;
   nextCursor: string;
+  /** drain: matches remain past this page. */
+  hasMore?: boolean;
   player?: string;
   capturing?: boolean;
 }
@@ -157,6 +167,10 @@ export function registerPerfTools(context: ToolContext): void {
         "Filter with `level` to see only errors, or `pattern` to follow one " +
         "subsystem's logging. Up to 2000 lines are held, so prefer a filter over " +
         "a large `limit`.\n\n" +
+        "`mode=\"drain\"` reads a busy log without gaps: oldest unread matches first, " +
+        "and a cursor that stops at the first one not shown. Keep the same filters " +
+        "while draining. `group` collapses identical lines into one with a count. " +
+        "An error whose stack trace arrived late comes back once more, marked `update`.\n\n" +
         "Each connected session keeps its own log, recorded from the moment its " +
         "plugin loaded — the editor session and a running playtest server do not " +
         "share one. To read what a playtest printed, target the playtest's " +
@@ -177,6 +191,14 @@ export function registerPerfTools(context: ToolContext): void {
         target: z.enum(["studio", "client"]).default("studio").describe("Output source; client requires a running playtest server studioId."),
         player: z.string().optional().describe("Client only: player name, required when multiple players are present."),
         since: z.string().optional().describe("Opaque nextCursor from a previous console response; return only newer matching lines."),
+        mode: z
+          .enum(["tail", "drain"])
+          .default("tail")
+          .describe(
+            "'tail': the newest matches, cursor at the end of the log. 'drain': the oldest " +
+              "unread matches, cursor at the first one not shown, so a loop reads every line once.",
+          ),
+        group: z.boolean().default(false).describe("Collapse identical lines into one row with a count and first/last times."),
         level: z
           .enum(["print", "info", "warning", "error"])
           .optional()
@@ -196,7 +218,16 @@ export function registerPerfTools(context: ToolContext): void {
     async (args): Promise<ToolResult> => {
       const response = await bridge.call<ConsoleResponse>(
         "perf.console",
-        { level: args.level, pattern: args.pattern, limit: args.limit, target: args.target, player: args.player, since: args.since },
+        {
+          level: args.level,
+          pattern: args.pattern,
+          limit: args.limit,
+          target: args.target,
+          player: args.player,
+          since: args.since,
+          mode: args.mode,
+          group: args.group,
+        },
         { studioId: args.studioId },
       );
 
@@ -226,7 +257,10 @@ export function registerPerfTools(context: ToolContext): void {
       // read as further unrelated output.
       let lines = response.items.map((entry) => {
         const when = args.target === "client" && entry.timestamp ? ` ${new Date(entry.timestamp * 1000).toISOString()}` : "";
-        const head = `[${entry.level}${when}] ${entry.message}`;
+        const head =
+          `[${entry.level}${entry.updated ? " update" : ""}${when}] ${entry.message}` +
+          (entry.count !== undefined && entry.count > 1 ? `  (x${entry.count})` : "") +
+          (entry.context ? `\n    context: ${entry.context}` : "");
         if (!entry.stack) return head + (entry.source ? `\n    in ${entry.source}` : "");
         const trace = entry.stack
           .split("\n")
@@ -240,9 +274,11 @@ export function registerPerfTools(context: ToolContext): void {
       const notes: string[] = [];
       // Keep the newest complete entries under the tool's response budget.
       // A noisy script must never turn one console read into a huge prompt.
+      // Never while draining: the cursor already counts every row as read, so a
+      // row dropped here would be lost. The plugin sized that page to fit.
       let sizeOmitted = 0;
       let size = lines.reduce((sum, line) => sum + line.length + 1, 0);
-      while (lines.length > 1 && size > 20_000) {
+      while (args.mode !== "drain" && lines.length > 1 && size > 20_000) {
         size -= lines.shift()!.length + 1;
         sizeOmitted += 1;
       }
@@ -250,6 +286,7 @@ export function registerPerfTools(context: ToolContext): void {
         lines = [`${lines[0]!.slice(0, 19_900)}… [entry truncated]`];
       }
       if (sizeOmitted > 0) notes.push(`${sizeOmitted} older matching lines omitted to fit the response`);
+      if (response.hasMore) notes.push("more unread lines: call again with this cursor and the same filters");
       if (response.dropped > 0) {
         notes.push(
           `showing the newest ${response.items.length} of ${response.total} matching lines`,
@@ -637,24 +674,48 @@ export function registerPerfTools(context: ToolContext): void {
           // ranked list, so cutting it drops whole categories rather than the
           // least interesting tail — the first version hid twelve of them.
           const shown = section.entries.slice(0, 120);
-          const rows = shown
-            .map((entry) => {
-              const indent = "  ".repeat(entry.depth);
-              const size =
-                entry.size !== undefined
-                  ? ` — ${count(entry.size, section.unit)}`
-                  : entry.triangles !== undefined
-                    ? ` — ${count(entry.triangles, "triangles")}, ${count(entry.drawcalls ?? 0, "draw calls")}`
-                    : "";
-              // Owners are what turn a number into something actionable: the
-              // asset's size says how much, the owners say who to go and look at.
-              const owners =
-                entry.owners && entry.owners.length > 0
-                  ? `\n${indent}    used by ${entry.owners.slice(0, 3).join(", ")}`
+
+          const renderEntry = (entry: SceneEntry): string => {
+            const indent = "  ".repeat(entry.depth);
+            const size =
+              entry.size !== undefined
+                ? ` — ${count(entry.size, section.unit)}`
+                : entry.triangles !== undefined
+                  ? ` — ${count(entry.triangles, "triangles")}, ${count(entry.drawcalls ?? 0, "draw calls")}`
                   : "";
-              return `${indent}${entry.name}${size}${owners}`;
-            })
-            .join("\n");
+            // Owners are what turn a number into something actionable: the
+            // asset's size says how much, the owners say who to go and look at.
+            const owners =
+              entry.owners && entry.owners.length > 0
+                ? `\n${indent}    used by ${entry.owners.slice(0, 3).join(", ")}`
+                : "";
+            return `${indent}${entry.name}${size}${owners}`;
+          };
+
+          // A category whose children are bare counts goes on one line —
+          // "Physics — 10 instances: Motor6D 6, WeldConstraint 2" — instead of a
+          // line per class repeating the unit. Children with owners or triangles
+          // keep their own lines, since those say more than a count.
+          const bare = (entry: SceneEntry, parent: SceneEntry) =>
+            entry.depth === parent.depth + 1 &&
+            entry.size !== undefined &&
+            entry.owners === undefined &&
+            entry.triangles === undefined;
+          const lines: string[] = [];
+          for (let index = 0; index < shown.length; index += 1) {
+            const entry = shown[index]!;
+            let end = index + 1;
+            while (end < shown.length && bare(shown[end]!, entry)) end += 1;
+            const closed = end === shown.length || shown[end]!.depth <= entry.depth;
+            if (entry.size !== undefined && end > index + 1 && closed) {
+              const children = shown.slice(index + 1, end);
+              lines.push(`${renderEntry(entry)}: ${children.map((child) => `${child.name} ${child.size}`).join(", ")}`);
+              index = end - 1;
+              continue;
+            }
+            lines.push(renderEntry(entry));
+          }
+          const rows = lines.join("\n");
 
           const dropped = section.entries.length - shown.length;
           blocks.push(`${heading}\n${rows}${dropped > 0 ? `\n  (${dropped} more)` : ""}`);

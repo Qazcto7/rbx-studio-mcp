@@ -41,5 +41,14 @@ for _, child in relay.children do
 end
 assert(chunk ~= nil, "a Chunk module is created")
 assert(chunk.Source == "return function(...) return 1\nend", "the source is wrapped as a function")
-assert(#relay.children == 5, "four cloned modules plus the chunk")
+assert(#relay.children == 6, "five cloned modules plus the chunk")
+-- By name: ExecRuntime requires LogBuffer, and a relay without it failed on the
+-- client with "Requested module experienced an error while loading" (upstream 0.8.3).
+local cloned = {}
+for _, child in relay.children do
+	if child.label then cloned[child.label] = true end
+end
+for _, name in { "ExecRuntime", "LogBuffer", "Serialize", "Paths", "Dispatch" } do
+	assert(cloned[name], name .. " is cloned onto the relay")
+end
 print("exec client: settle, clamping and relay setup pass")

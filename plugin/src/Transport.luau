@@ -26,7 +26,9 @@ local Transport = {}
 export type Status = "disconnected" | "connecting" | "connected"
 
 type Callbacks = {
-	onCommand: (id: string, op: string, params: { [string]: any }?) -> (),
+	-- `deadlineMs` is when the server stops waiting for the reply, on this
+	-- machine's clock: the server sends a duration, never a time (see Command.timeoutMs).
+	onCommand: (id: string, op: string, params: { [string]: any }?, deadlineMs: number?) -> (),
 	onStatus: (status: Status, detail: string?) -> (),
 	--[[
 		Anything the bridge wants to tell this plugin that is not a command.
@@ -243,7 +245,8 @@ local function handleFrame(callbacks: Callbacks, frame: { [string]: any })
 	local id = frame.id
 	local op = frame.op
 	if typeof(id) == "string" and typeof(op) == "string" then
-		callbacks.onCommand(id, op, frame.params)
+		local deadline = if typeof(frame.timeoutMs) == "number" then DateTime.now().UnixTimestampMillis + frame.timeoutMs else nil
+		callbacks.onCommand(id, op, frame.params, deadline)
 		return
 	end
 	if typeof(frame.event) == "string" then

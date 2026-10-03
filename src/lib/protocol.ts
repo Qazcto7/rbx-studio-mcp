@@ -10,6 +10,17 @@
 /** A single request from the MCP server to one Studio instance. */
 export interface Command {
   id: string;
+  /**
+   * How long the server waits for the reply. The plugin turns it into a
+   * deadline on its own clock when the command arrives, and refuses to start
+   * work past it -- including work that waited behind the mutation lock --
+   * since nobody would hear the result and a retry may already be coming.
+   *
+   * Relative on purpose: an absolute time from the server's clock compared
+   * against Studio's would refuse everything whenever the two drift apart,
+   * which a server in WSL does by seconds or minutes after a sleep.
+   */
+  timeoutMs?: number;
   /** Handler name the plugin dispatches on, e.g. "inspect" or "script.edit". */
   op: string;
   params: Record<string, unknown>;

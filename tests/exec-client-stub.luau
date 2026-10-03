@@ -47,6 +47,7 @@ local script = {
 	Parent = {
 		Parent = {
 			ExecRuntime = clonable("ExecRuntime"),
+			LogBuffer = clonable("LogBuffer"),
 			Serialize = clonable("Serialize"),
 			Paths = clonable("Paths"),
 			Dispatch = clonable("Dispatch"),

@@ -1,6 +1,6 @@
 # Roblox Studio MCP
 
-Let an AI agent drive Roblox Studio: read your place, edit scripts, build geometry, run playtests, take screenshots. 35 tools. MIT.
+Let an AI agent drive Roblox Studio: read your place, edit scripts, build geometry, run playtests, take screenshots. 36 tools. MIT.
 
 ![The Studio MCP panel](docs/rbx-studio.png)
 
@@ -85,7 +85,7 @@ Port is **44755**, loopback only. Change it with `--port` and match it in the pl
 |---|---|
 | **Session** | `studio_status` `list_studios` `set_active_studio` |
 | **Discover** | `tree` `inspect` `find` `api` |
-| **Scripts** | `script_read` `script_edit` `script_grep` `script_create` |
+| **Scripts** | `script_read` `script_edit` `script_grep` `script_create` `sync` |
 | **Instances** | `create` `modify` `delete` `move` |
 | **World** | `geometry` `terrain` `generate` `assets` `collision` `audio` `undo` |
 | **Data & live game** | `datastore` `universe` |
@@ -93,6 +93,23 @@ Port is **44755**, loopback only. Change it with `--port` and match it in the pl
 | **Look** | `screenshot` `viewport` `device` |
 
 Write tools take arrays — ten script edits is one call, one **Ctrl+Z**, and all-or-nothing.
+
+## Work on files
+
+`sync` mirrors your scripts into a folder, so an agent can edit code with its own file tools and use Studio to test.
+
+```
+sync op="pull"      # Studio -> ./studio
+sync op="push"      # ./studio -> Studio
+sync op="watch"     # both ways, live, until op="stop"
+```
+
+- Rojo-style layout: `Main.server.luau`, `.client.luau`, `.luau`; a script with children is a folder with `init`.
+- Rename or move a file and the script moves with it, keeping its attributes and references.
+- Edited on both sides? It's a conflict and neither side is touched. Studio's version waits in `.rbx-sync/conflicts/`; merge into the file and sync again, or pass `prefer: "studio"` / `"disk"`.
+- Deleting a file deletes the script (one Ctrl+Z). A script deleted in Studio sends its file to `.rbx-sync/trash`.
+- `export` writes UI or any instance tree as a `.build.json` file; edit it and `build` rebuilds it, keeping its scripts. Edits made in Studio flow back into the file.
+- `watch` only works when something changes: about 0.5s each way, even with 2,000 scripts. Conflicts show up in the agent's next reply.
 
 ## Open Cloud
 
@@ -103,10 +120,10 @@ Some calls reach past Studio to Roblox itself. All need one API key; everything 
 | `assets op="upload"` | send a local audio/image/model/video file, get an asset id |
 | `datastore target="live"` | the running game's real player data |
 | `execute_luau target="live"` | run a script on the published place |
-| `universe` | restart servers, message them, ban players |
+| `universe` | restart servers, message them, ban players, read server logs, sell products and passes |
 | also | `assets op="grant"`, `op="publish"`, `script_read`/`script_edit target="live"` |
 
-Make a key at [Creator Dashboard → Credentials](https://create.roblox.com/dashboard/credentials), adding the permissions you want: `assets`, `universe-datastores`, `ordered-data-stores`, `luau-execution-sessions`, `universe-places`, `universe-place-instances`, `universe`, `messaging-service`, `user-restrictions`, `inventory`, `users`, `asset-permissions`.
+Make a key at [Creator Dashboard → Credentials](https://create.roblox.com/dashboard/credentials), adding the permissions you want: `assets`, `universe-datastores`, `ordered-data-stores`, `luau-execution-sessions`, `universe-places`, `universe-place-instances`, `universe`, `messaging-service`, `user-restrictions`, `inventory`, `users`, `asset-permissions`, `developer-products`, `game-passes`.
 
 Then in the Studio panel:
 
@@ -122,7 +139,7 @@ Two things to watch: a playtest connects a second session, so pass `studioId` an
 
 ## The console panel
 
-Every call is logged with how long it took. At the foot of the panel is a command line — type a command, or type a sentence and a coding agent answers it.
+Every call is logged with how long it took. At the foot of the panel is a command line. Type a command — or run `chat on` and type a sentence to have a coding agent answer it.
 
 | | |
 |---|---|
@@ -133,12 +150,13 @@ Every call is logged with how long it took. At the foot of the panel is a comman
 | `theme [name]` `visuals` `autoopen [on\|off]` `log [level]` `clear` `copy` | the panel |
 | `port [n]` `reconnect` | the connection |
 | `cloud [key\|user\|group\|test\|forget]` | the Open Cloud key `upload` uses |
+| `chat [on\|off]` | let an agent answer sentences (off by default) |
 | `agent [use <id>\|new]` `stop` | which agent runs your prompts |
-| anything else | sent to that agent |
+| anything else | sent to that agent, once `chat` is on |
 
 Click the bar and every command is listed with what it does. Keep typing to filter, scroll for the rest, click one to fill it in.
 
-**Prompts start a real agent** — whichever you have on PATH: Claude Code, Codex, opencode, Gemini, Cursor, Amp, Qwen Code, Factory Droid, goose, Copilot CLI, Aider, Crush, DeepSeek Harness. It runs headless, drives the same Studio, and its work appears in the log. It is a separate session from your terminal, billed separately, and allowed the `rbx-studio` tools only. `stop` cancels it.
+**With `chat on`, prompts start a real agent** — whichever you have on PATH: Claude Code, Codex, opencode, Gemini, Cursor, Amp, Qwen Code, Factory Droid, goose, Copilot CLI, Aider, Crush, DeepSeek Harness. It runs headless, drives the same Studio, and its work appears in the log. It is a separate session from your terminal, billed separately, and allowed the `rbx-studio` tools only. `stop` cancels it.
 
 Eight themes behind the tab on the right edge. Your pick is remembered.
 
@@ -171,7 +189,7 @@ The same row, commented, is in `config/dsh.cordis.yml` for use with `dsh --patch
 
 ## Security
 
-Loopback only, and requires a header a browser cannot set cross-origin. Your experience's "Allow HTTP Requests" setting is untouched.
+Loopback only. Requests need a header a browser cannot set cross-origin and a loopback `Host`, so a web page cannot reach it, even through DNS rebinding. Your experience's "Allow HTTP Requests" setting is untouched.
 
 ## Development
 
@@ -183,6 +201,8 @@ npm test
 ```
 
 Needs `luau`, `luau-compile` and `luau-analyze` from [the Luau releases](https://github.com/luau-lang/luau/releases) on `PATH` or in `tools/`.
+
+With Studio open and the plugin loaded, `node scripts/test-live.mjs` checks the transport and `node scripts/test-live-tools.mjs [--playtest]` runs every tool, `node scripts/test-live-sync.mjs` checks `sync`, and `node scripts/test-live-sync-scale.mjs` times it on 2,000 scripts. All clean up after themselves.
 
 ## Licence
 

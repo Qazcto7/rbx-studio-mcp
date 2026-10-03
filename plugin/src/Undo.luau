@@ -18,6 +18,8 @@
 
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 
+local Dispatch = require(script.Parent.Dispatch)
+
 local Undo = {}
 
 --[[
@@ -132,13 +134,57 @@ end
 	is something tools tell the agent, and therefore the user, so it has to be
 	observed rather than assumed: a claim of "one Ctrl+Z" that silently degrades
 	to no undo entry at all is worse than no claim.
+
+	Refusing instead is not an option either: Studio opens no recording at all
+	inside a running playtest (measured), so a refusal would make every write
+	tool unusable against the runtime session.
 ]]
+
+-- Opens a recording, or nil. Guarded because an engine error here must not
+-- escape with the lock held.
+local function begin(name: string, displayName: string): string?
+	local ok, identifier = pcall(function()
+		return ChangeHistoryService:TryBeginRecording(name, displayName)
+	end)
+	return if ok then identifier else nil
+end
+
+--[[
+	Runs `body` after the lock is ours, unless the request expired while it
+	waited. The server stops waiting at its timeout, so work that starts later
+	would be reported to nobody -- and an agent told "timed out" is likely to
+	retry it.
+]]
+local function run<T>(body: () -> T): (boolean, any)
+	return pcall(function()
+		Dispatch.checkDeadline()
+		return body()
+	end)
+end
+
+-- Closes a recording. A failure here is reported, with the lock released, as
+-- an outcome the agent must check rather than assume.
+local function finish(identifier: string, operation: Enum.FinishRecordingOperation, acquired: boolean)
+	local ok, err = pcall(function()
+		ChangeHistoryService:FinishRecording(identifier, operation)
+	end)
+	if ok then
+		return
+	end
+	release(acquired)
+	Dispatch.fail(
+		"UNDO_FAILED",
+		string.format("Studio could not close the undo recording: %s", tostring(err)),
+		"The change may or may not have applied. Inspect the affected instances before retrying."
+	)
+end
+
 function Undo.record<T>(name: string, displayName: string, body: () -> T): (T, boolean)
 	local acquired = acquire()
 
-	local identifier = ChangeHistoryService:TryBeginRecording(name, displayName)
+	local identifier = begin(name, displayName)
 	if not identifier then
-		local ok, result = pcall(body)
+		local ok, result = run(body)
 		release(acquired)
 		if not ok then
 			error(result, 0)
@@ -146,15 +192,15 @@ function Undo.record<T>(name: string, displayName: string, body: () -> T): (T, b
 		return result, false
 	end
 
-	local ok, result = pcall(body)
+	local ok, result = run(body)
 	if ok then
-		ChangeHistoryService:FinishRecording(identifier, Enum.FinishRecordingOperation.Commit)
+		finish(identifier, Enum.FinishRecordingOperation.Commit, acquired)
 		release(acquired)
 		return result, true
 	end
 
-	ChangeHistoryService:FinishRecording(identifier, Enum.FinishRecordingOperation.Cancel)
-	dropRedo()
+	finish(identifier, Enum.FinishRecordingOperation.Cancel, acquired)
+	pcall(dropRedo)
 	release(acquired)
 	error(result, 0)
 end
@@ -167,9 +213,9 @@ end
 function Undo.recordPartial<T>(name: string, displayName: string, body: () -> T): (T, boolean)
 	local acquired = acquire()
 
-	local identifier = ChangeHistoryService:TryBeginRecording(name, displayName)
+	local identifier = begin(name, displayName)
 	if not identifier then
-		local ok, result = pcall(body)
+		local ok, result = run(body)
 		release(acquired)
 		if not ok then
 			error(result, 0)
@@ -177,13 +223,31 @@ function Undo.recordPartial<T>(name: string, displayName: string, body: () -> T)
 		return result, false
 	end
 
-	local ok, result = pcall(body)
-	ChangeHistoryService:FinishRecording(identifier, Enum.FinishRecordingOperation.Commit)
+	local ok, result = run(body)
+	finish(identifier, Enum.FinishRecordingOperation.Commit, acquired)
 	release(acquired)
 	if not ok then
 		error(result, 0)
 	end
 	return result, true
+end
+
+--[[
+	Holds the mutation lock without opening a recording.
+
+	For script source, whose undo is the script editor's own, per document --
+	a recording would add an empty step, not make the edit undoable. The lock
+	is what matters: two batches writing the same scripts must not interleave
+	their writes and their rollbacks.
+]]
+function Undo.exclusive<T>(body: () -> T): T
+	local acquired = acquire()
+	local ok, result = run(body)
+	release(acquired)
+	if not ok then
+		error(result, 0)
+	end
+	return result
 end
 
 return Undo

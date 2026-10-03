@@ -6,7 +6,7 @@ What changed in each release, written for people using the server rather than fo
 
 Fixes for running Studio under Wine/Vinegar on Linux, found while using the server there day to day.
 
-This fork is merged with upstream 0.8.0 but **keeps the `animation` tool**, which upstream removed in 0.8.0 without a stated reason: `read`, `build`, `preview` and this fork's `play` are all still here.
+This fork is merged with upstream 0.8.6 but **keeps the `animation` tool**, which upstream removed in 0.8.0 without a stated reason: `read`, `build`, `preview` and this fork's `play` are all still here.
 
 ### Fixed
 - **Stale plugin on Linux.** `--install-plugin` now finds Studio's plugins folder under Vinegar (native and Flatpak) and Wine prefixes and installs into every one it finds, instead of exiting on Linux. `STUDIO_MCP_PLUGINS_DIR` overrides the search. `doctor` checks each folder against this package's build id and flags a stale or truncated file.
@@ -41,14 +41,90 @@ This fork is merged with upstream 0.8.0 but **keeps the `animation` tool**, whic
 - `check:plugin` now also analyses the client relays -- the Luau inside `[==[ ... ]==]` strings in Input, Capture, animation play, exec and debug -- which it had never seen a line of, so a mistyped name in a branch their tests do not drive would have shipped (it found one shadowed local straight away, now renamed). It also requires every plugin file to be `--!strict`: in a non-strict file the analyser does not report a global that is written in one function and read in another, which is the exact shape of the two undeclared-variable bugs this check was added for. It also no longer passes in silence when it could not analyse anything: a missing `luau-analyze` is a loud warning locally and a failure in CI, and an analyser that cannot run fails the check.
 - `playtest op="stop"`'s clearing of a start that never returned now needs Studio's edit mode to be confirmed, not merely not contradicted: when `EditModeActive` could not be read, a healthy test running for 2+ minutes looked like an abandoned start and was cleared, letting the next `play` start a second test on top of it. A cleared launch that returns late can no longer write its result into state.
 - A timeout while a playtest start is in flight used to replace the "never reached Studio -- the window may have lost its connection" advice outright with "Studio is busy, poll `playtest state`". When the command was never delivered both are possible, and a `state` poll would sit in the same queue, so the busy advice now leads and the lost-connection one follows it.
-- `--install-plugin` stages its copy under a per-process name, so two installs at once cannot move each other's half-written file into place. The package and README say 35 tools (this fork keeps `animation`).
+- `--install-plugin` stages its copy under a per-process name, so two installs at once cannot move each other's half-written file into place. The package and README say 36 tools (upstream's 35, plus `animation`, which this fork keeps).
+- Tool notes were cut silently at 450 characters (upstream 0.8.5's bounded replies), which removed exactly the part to act on: the end of the animation `build` note (how to use the animation in a real game) and `input`'s "COULD NOT RELEASE". Notes are now bounded at 2,000 characters and say so when clipped.
 ### Added
 - `animation op="play"`: loads and plays a kept KeyframeSequence (from a prior `build` called with `parent`) on a running playtest's client in one call -- registers it, finds the right Animator (creating one if the rig has never played anything), loads, and plays, with a specific reason on failure at each step. This replaces the four lines of client Luau the `build` reply used to hand back for the agent to paste into `execute_luau target="client"`, which was real friction: shipping an animation that actually plays in a playtest was the one thing this server could describe but not do.
 - `input` step `kind="release_all"`: releases every mouse button (and an optional `key`) and reports what it found, as the way out of a stuck button.
 - `animation op="build"` takes `parent`, which keeps the built KeyframeSequence in the place as a real instance so the client can register it with `KeyframeSequenceProvider:RegisterKeyframeSequence`. This is the way to ship an animation to a real playtest.
 - `execute_luau target="client"` takes `settleSeconds`, which keeps the relay alive after the chunk returns so `task.spawn` threads can finish, and warns when code spawns threads without it.
 - `create`/`modify` warn when a bare-hash id from `animation op="build"` is written to an `AnimationId`: those ids are preview-only, and loading one in a playtest breaks the character's whole Animator.
-- `playtest op="multiplayer"` is refused on Linux unless `force: true` (or `STUDIO_MCP_ALLOW_MULTIPLAYER=1`); it is unreliable under Wine and has crashed Studio. A `play` that is slow to start now says to poll `state` rather than send it again.
+- `playtest op="multiplayer"` (and upstream 0.8.2's `op="addPlayers"`, which starts extra clients the same way) is refused on Linux unless `force: true` (or `STUDIO_MCP_ALLOW_MULTIPLAYER=1`); it is unreliable under Wine and has crashed Studio. A `play` that is slow to start now says to poll `state` rather than send it again.
+
+## 0.8.6
+
+### Added
+- `sync`: work on scripts as files. Pull, push, two-way sync, or live `watch` between Studio and a folder (Rojo-style layout). Renames keep the same script; edits on both sides become conflicts, never overwrites.
+- `sync export` / `build`: UI and other instance trees as editable `.build.json` files, rebuilt in one undo step with their scripts kept.
+- `script_grep`: several `patterns` in one pass, plus `files` and `counts` modes.
+- `find properties=[...]`, `console mode="drain"`, and `screenshot player=`.
+
+### Fixed
+- `script_edit` never overwrites text typed while it writes.
+- A timed-out request no longer runs late in Studio.
+- Paging could skip or repeat rows; `Part[2]` could change meaning between calls.
+- `debug clear` only removes the MCP's breakpoints.
+- Colours read and written back no longer drift darker.
+
+## 0.8.5
+
+Withdrawn; replaced by 0.8.6.
+
+## 0.8.4
+
+### Changed
+- Typing a sentence in the panel no longer starts an agent by default. Run `chat on` to turn it on, `chat off` to turn it off again; the choice is remembered. Commands are unaffected.
+
+## 0.8.3
+
+### Added
+- `inspect` says why a requested property came back missing: a typo (with a suggestion), unset, or unreadable.
+- `find` and `tree` point out a `className` that is not a Roblox class.
+
+### Changed
+- Screenshots encode faster (up to 8x on flat UI screens, same picture).
+- `studio_status` answers faster: its two reads now run at once.
+- Property and class checks stay current in long sessions: the Roblox API list refreshes daily, not only at startup.
+- Dependencies updated (MCP SDK 1.31); CI also tests Node 24.
+
+### Fixed
+- `execute_luau target="client"` failed with "Requested module experienced an error while loading" (broken since 0.8.2).
+- Zero-length inputs are refused instead of answering "nothing there": `viewport raycast`, `collision cast` and `overlap`, and `terrain` fills or regions with an empty side.
+- `viewport focus` (zero `from`) and `viewport camera` (`position` equal to `lookAt`) no longer give the camera a broken position.
+- `collision remove` on a group that does not exist said it was removed.
+- `debug set` on a line past the end of the script blamed the Debugger beta setting.
+- A call that timed out could still run in Studio later; it is now dropped.
+- Calls to a Studio that has just closed fail cleanly instead of escaping error handling.
+- The bridge refuses requests whose `Host` is not loopback, closing a DNS-rebinding hole.
+- A server taking over the bridge port while shutting down could stay running.
+- `assets publish` said to pass `publish: true`; it is `confirm: true`.
+- Panel agent output no longer hides calls to other MCP servers, and its temp files are removed on exit.
+- The panel no longer saves its size while the plugin is unloading.
+
+## 0.8.2
+
+### Added
+- `universe op="servers"` / `op="logs"`: live servers and their error/warning logs.
+- `universe op="products"` / `op="sell"`: list and create developer products and game passes.
+- `playtest op="addPlayers"`: add players to a running multiplayer test.
+- `geometry` supports `Tunable` collision fidelity.
+- `console` and `execute_luau` show structured-log context (`LogService:Info(msg, {…})`).
+
+### Changed
+- Smaller replies: `inspect` children, `collision overlap` as a table, one-line `performance scene` categories, rounded numbers.
+- `inspect` standard detail drops noise (`Rotation`, surfaces, zero velocities).
+
+### Fixed
+- `device network`: packet loss was applied 100x too small; `stop` no longer leaves memory emulated at 0 MB.
+- `datastore set` (Studio and live) no longer wipes a key's user ids and metadata.
+- A bad position/vector is an error instead of being silently ignored.
+- `assets insert` keeps the model's rotation when moved.
+- `collision assign` refuses a group that does not exist.
+- `character op="path"` starts from the character when `from` is omitted.
+- `audio graph` no longer warns about a missing listener that Roblox provides.
+- `playtest stop` no longer reports a leftover player.
+- `terrain stats` no longer reports a wrong limit.
+- Open Cloud calls can no longer hang, and rate limits say how long to wait.
 
 ## 0.8.0
 

@@ -28,6 +28,8 @@ local Scope = require(script.Parent.Parent.Scope)
 -- swamp any context window.
 local MAX_LOG_ENTRIES = 500
 local DEFAULT_LOG_ENTRIES = 100
+-- Characters of log rows one console read picks. See `take` in Perf.console.
+local CONSOLE_BUDGET = 16_000
 
 -- Profiling is a blocking wait, so the ceiling is what a caller will sit through
 -- rather than what the profiler can manage.
@@ -116,21 +118,21 @@ function Perf.console(params: { [string]: any }): { [string]: any }
 	local oldest = if #history > 0 then history[1].sequence or 1 else latest + 1
 	local missed = if since ~= nil then math.max(0, oldest - since - 1) else 0
 
-	local entries: { { [string]: any } } = {}
-	local matched = 0
+	local mode = params.mode or "tail"
+	if mode ~= "tail" and mode ~= "drain" then
+		Dispatch.fail("BAD_PARAMS", string.format("%q is not a console mode.", tostring(mode)), "Use tail or drain.")
+	end
 
+	local matches: { LogBuffer.Entry } = {}
 	for _, item in history do
 		if since ~= nil and (item.sequence or 0) <= since then continue end
-		local kind = item.level
-		if level and kind ~= level then
+		if level and item.level ~= level then
 			continue
 		end
-
-		local message = item.message
 		if pattern then
 			-- An invalid pattern raises rather than failing to match, so it is
 			-- reported as a pattern problem instead of an empty result.
-			local valid, position = pcall(string.find, message, pattern)
+			local valid, position = pcall(string.find, item.message, pattern)
 			if not valid then
 				Dispatch.fail(
 					"BAD_PATTERN",
@@ -142,33 +144,111 @@ function Perf.console(params: { [string]: any }): { [string]: any }
 				continue
 			end
 		end
-
-		matched += 1
-		table.insert(entries, {
-			level = kind,
-			message = message,
-			timestamp = item.timestamp,
-			stack = item.stack,
-			source = item.source,
-		})
+		table.insert(matches, item)
 	end
 
-	-- Trimmed from the front: the newest lines are the ones worth keeping.
-	local dropped = 0
-	if #entries > limit then
-		dropped = #entries - limit
-		entries = table.move(entries, dropped + 1, #entries, 1, {})
+	--[[
+		Rows are picked against a size budget as well as `limit`.
+
+		One noisy script printing long lines used to fill a read with a few
+		hundred of them, which the server then cut down to fit its response
+		limit -- dropping lines this side had already reported as delivered. A
+		budget here means what is picked is what is shown. The first row is always
+		taken, whatever its size, so a single huge entry cannot stall a drain.
+	]]
+	local selected: { { [string]: any } } = {}
+	local budget = CONSOLE_BUDGET
+	local function take(item: LogBuffer.Entry): boolean
+		local stack = item.stack
+		local cost = #item.message + 300
+			+ (if stack then #stack + #string.split(stack, "\n") * 8 else 0)
+			+ (if item.source then #item.source else 0)
+			+ (if item.context then #item.context else 0)
+		if #selected >= limit or (cost > budget and #selected > 0) then
+			return false
+		end
+		budget -= cost
+		table.insert(selected, {
+			sequence = item.sequence,
+			updated = item.updated,
+			level = item.level,
+			message = item.message,
+			timestamp = item.timestamp,
+			stack = stack,
+			source = item.source,
+			context = item.context,
+		})
+		return true
+	end
+
+	--[[
+		`tail` answers "what just happened": the newest matches, and a cursor at
+		the end of the log, so a following read sees only what comes after.
+
+		`drain` answers "what happened, all of it": the oldest unread matches,
+		and a cursor just before the first one not shown, so reading on in a loop
+		delivers every match exactly once however busy the log is. That only
+		holds with the same filters each time -- the cursor is a position, and it
+		does not remember what the filter skipped.
+	]]
+	local watermark = latest
+	if mode == "drain" then
+		for _, item in matches do
+			if not take(item) then
+				watermark = (item.sequence or latest + 1) - 1
+				break
+			end
+		end
+	else
+		for index = #matches, 1, -1 do
+			if not take(matches[index]) then
+				break
+			end
+		end
+		-- Picked newest first; read oldest first, the way the Output window does.
+		local ordered: { { [string]: any } } = {}
+		for index = #selected, 1, -1 do
+			table.insert(ordered, selected[index])
+		end
+		selected = ordered
+	end
+	local consumed = #selected
+
+	-- Identical lines collapse into one row with a count, after the cursor is
+	-- settled: grouping changes how rows are shown, never which were consumed.
+	if params.group == true then
+		local grouped: { { [string]: any } } = {}
+		local byKey: { [string]: { [string]: any } } = {}
+		for _, item in selected do
+			local key = table.concat({
+				item.level, item.message, item.source or "", item.stack or "", item.context or "",
+				if item.updated then "u" else "",
+			}, "\0")
+			local group = byKey[key]
+			if group then
+				group.count += 1
+				group.lastTimestamp = item.timestamp
+			else
+				item.count = 1
+				item.firstTimestamp = item.timestamp
+				item.lastTimestamp = item.timestamp
+				byKey[key] = item
+				table.insert(grouped, item)
+			end
+		end
+		selected = grouped
 	end
 
 	return {
-		items = entries,
-		total = matched,
-		dropped = dropped,
+		items = selected,
+		total = #matches,
+		dropped = if mode == "tail" then #matches - consumed else 0,
+		hasMore = mode == "drain" and consumed < #matches,
 		-- Lines lost to the buffer's own capacity, as opposed to ones trimmed to
 		-- satisfy this call's limit. Only the first is a reason to worry.
 		evicted = if since ~= nil then (if missed > 0 then missed else nil) else (if evicted > 0 then evicted else nil),
 		recordingSeconds = recordingSeconds,
-		nextCursor = token .. ":" .. tostring(latest),
+		nextCursor = token .. ":" .. tostring(watermark),
 		player = if player then player.Name else nil,
 		capturing = if player then LogBuffer.clientReady(player) else true,
 	}

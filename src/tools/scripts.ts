@@ -39,17 +39,73 @@ interface EditResponse {
   }>;
 }
 
+interface GrepMatch {
+  path: string;
+  /** The script's `rev`, for `script_edit`'s `revision`. */
+  revision?: string;
+  line: number;
+  text: string;
+  before?: string[];
+  after?: string[];
+  /** 1-based indexes into `patterns` this line matched, when there are several. */
+  needles?: number[];
+  /** The line was cut to fit the response. */
+  truncated?: boolean;
+}
+
 interface GrepResponse {
-  items: Array<{
-    path: string;
-    line: number;
-    text: string;
-    before?: string[];
-    after?: string[];
-  }>;
+  items: GrepMatch[];
   total: number;
   offset: number;
   searched: number;
+  /** mode=counts: matching lines per pattern, and scripts with any. */
+  counts?: number[];
+  matchedFiles?: number;
+}
+
+/**
+ * Matches grouped under one header per script, context merged.
+ *
+ * With context on, neighbouring matches share lines, and printing each match's
+ * window separately showed the same lines two and three times -- some of them
+ * as context under one match while being a match themselves. One block per
+ * script, each line once, `:` for a match and `-` for context, as grep does.
+ */
+function renderMatches(matches: GrepMatch[], tagNeedles: boolean): string {
+  const groups = new Map<string, { header: string; lines: Map<number, string>; hits: Set<number> }>();
+  for (const match of matches) {
+    let group = groups.get(match.path);
+    if (group === undefined) {
+      group = {
+        header: match.revision ? `${match.path}  rev=${match.revision}` : match.path,
+        lines: new Map(),
+        hits: new Set(),
+      };
+      groups.set(match.path, group);
+    }
+    const first = match.line - (match.before?.length ?? 0);
+    for (const [index, line] of (match.before ?? []).entries()) {
+      if (!group.hits.has(first + index)) group.lines.set(first + index, line);
+    }
+    group.hits.add(match.line);
+    group.lines.set(
+      match.line,
+      match.text +
+        (match.truncated ? "  [line cut; read it with script_read]" : "") +
+        (tagNeedles && match.needles ? `  [patterns ${match.needles.join(",")}]` : ""),
+    );
+    for (const [index, line] of (match.after ?? []).entries()) {
+      if (!group.hits.has(match.line + index + 1)) group.lines.set(match.line + index + 1, line);
+    }
+  }
+  return [...groups.values()]
+    .map((group) => {
+      const body = [...group.lines]
+        .sort(([a], [b]) => a - b)
+        .map(([number, line]) => `${number}${group.hits.has(number) ? ":" : "-"} ${line}`);
+      return [group.header, ...body].join("\n");
+    })
+    .join("\n\n");
 }
 
 interface CreateResponse {
@@ -582,12 +638,29 @@ export function registerScriptTools(context: ToolContext): void {
         "instead of backslash, there is no alternation, and `-` means a lazy " +
         "quantifier. Set `literal` to search for text exactly as written, which is " +
         "usually what you want for identifiers.\n\n" +
-        "Matches come from the script editor's live buffer, so unsaved edits are " +
-        "searched too.",
+        "To look for several identifiers, pass them together as `patterns` (literal, " +
+        "up to 16): one pass over the place instead of one per name, and each line " +
+        "says which of them it matched. `mode=\"files\"` lists matching scripts only; " +
+        "`mode=\"counts\"` gives matching-line counts per pattern.\n\n" +
+        "Results are grouped by script with its `rev`, which `script_edit` accepts " +
+        "as `revision`. Matches come from the script editor's live buffer, so " +
+        "unsaved edits are searched too.",
       inputSchema: {
         pattern: z
           .string()
+          .min(1)
+          .optional()
           .describe('Lua pattern, or exact text when `literal` is set, e.g. "PlayerAdded".'),
+        patterns: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(16)
+          .optional()
+          .describe("Several literal strings searched in one pass, instead of `pattern`."),
+        mode: z
+          .enum(["lines", "files", "counts"])
+          .default("lines")
+          .describe("'lines': matching lines. 'files': one row per matching script. 'counts': matching-line counts per pattern."),
         path: z
           .string()
           .optional()
@@ -621,11 +694,17 @@ export function registerScriptTools(context: ToolContext): void {
       readOnly: true,
     },
     async (args): Promise<ToolResult> => {
+      if ((args.pattern === undefined) === (args.patterns === undefined)) {
+        throw new ToolError("BAD_PARAMS", "Pass either `pattern` or `patterns`, not both and not neither.");
+      }
+      const needles = args.patterns ?? [args.pattern!];
       const offset = decodeCursor(args.cursor);
       const response = await bridge.call<GrepResponse>(
         "script.grep",
         {
           pattern: args.pattern,
+          patterns: args.patterns,
+          mode: args.mode,
           path: args.path,
           literal: args.literal,
           ignoreCase: args.ignoreCase,
@@ -636,6 +715,15 @@ export function registerScriptTools(context: ToolContext): void {
         },
         { studioId: args.studioId, timeoutMs: 30_000 },
       );
+
+      // Before the no-match branch: a zero is exactly what counts exist to say.
+      if (args.mode === "counts") {
+        return json({
+          searched: response.searched,
+          matchedFiles: response.matchedFiles ?? 0,
+          counts: needles.map((pattern, index) => ({ pattern, lines: response.counts?.[index] ?? 0 })),
+        });
+      }
 
       if (response.total === 0) {
         if (response.searched === 0) {
@@ -651,51 +739,53 @@ export function registerScriptTools(context: ToolContext): void {
         // silently. A regex habit writes `foo|bar`, Lua reads it as the literal
         // characters, nothing matches, and the empty result looks like an
         // answer rather than like a malformed pattern.
-        const alternation = !args.literal && args.pattern.includes("|");
+        const literal = args.literal || args.patterns !== undefined;
+        const alternation = !literal && (args.pattern ?? "").includes("|");
         return text(
           `No matches in ${response.searched} script(s).\n` +
             (alternation
               ? "This pattern contains `|`, which Lua patterns do not support — " +
                 "there is no alternation, so `|` matched as a literal character. " +
-                "Search one alternative per call, or set `literal`."
-              : args.literal
+                "Pass the alternatives as `patterns` instead."
+              : literal
                 ? "The match is literal and case-sensitive unless you set `ignoreCase`."
                 : "Check case, and remember patterns are Lua patterns — set `literal` " +
                   "to search for the text exactly as written."),
         );
       }
 
-      const lines: string[] = [];
-      let previousPath = "";
-      for (const match of response.items) {
-        // Context blocks get a separator; a flat list of adjacent lines is
-        // otherwise impossible to tell apart from a run of separate matches.
-        if (match.path !== previousPath) {
-          if (previousPath !== "") lines.push("");
-          previousPath = match.path;
-        }
-        for (const [index, before] of (match.before ?? []).entries()) {
-          lines.push(`${match.path}-${match.line - (match.before?.length ?? 0) + index}- ${before}`);
-        }
-        lines.push(`${match.path}:${match.line}: ${match.text}`);
-        for (const [index, after] of (match.after ?? []).entries()) {
-          lines.push(`${match.path}-${match.line + index + 1}- ${after}`);
-        }
+      if (args.mode === "files") {
+        return table(["path", "className", "revision", "matches"], response.items as unknown as Array<Record<string, unknown>>, {
+          offset,
+          total: response.total,
+          more: `searched ${response.searched} scripts`,
+        });
       }
 
-      const trailer: string[] = [`[searched ${response.searched} scripts]`];
-      const nextOffset = offset + response.items.length;
-      if (nextOffset < response.total) {
-        trailer.unshift(
-          `[showing ${response.items.length} of ${response.total} matches — call again ` +
-            `with cursor: "${encodeCursor(nextOffset)}"]`,
-        );
+      // Clipped by whole matches, so the cursor resumes at the first one not
+      // shown rather than skipping whatever a character cut dropped.
+      let shown = response.items.length;
+      let listing = renderMatches(response.items, needles.length > 1);
+      const budget = CHARACTER_LIMIT - 500;
+      if (listing.length > budget) {
+        let low = 1;
+        let high = shown;
+        while (low < high) {
+          const middle = Math.ceil((low + high) / 2);
+          if (renderMatches(response.items.slice(0, middle), needles.length > 1).length <= budget) low = middle;
+          else high = middle - 1;
+        }
+        shown = low;
+        listing = renderMatches(response.items.slice(0, shown), needles.length > 1);
+        if (listing.length > budget) listing = `${listing.slice(0, budget - 60)} [cut; read the script with script_read]`;
       }
 
-      return body(
-        [...lines, "", ...trailer].join("\n"),
-        "re-run with a smaller `limit` or a narrower `path`",
-      );
+      const nextOffset = offset + shown;
+      const trailer =
+        nextOffset < response.total
+          ? `[showing ${shown} of ${response.total} matches, searched ${response.searched} scripts — call again with cursor: "${encodeCursor(nextOffset)}"]`
+          : `[${response.total} match${response.total === 1 ? "" : "es"}, searched ${response.searched} scripts]`;
+      return text(`${listing}\n\n${trailer}`);
     },
   );
 

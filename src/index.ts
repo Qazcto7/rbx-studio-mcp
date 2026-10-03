@@ -20,6 +20,8 @@ import { registerTerrainTools } from "./tools/terrain.js";
 import { registerWorldTools } from "./tools/world.js";
 import { registerGenerateTools } from "./tools/generate.js";
 import { registerCharacterTools } from "./tools/character.js";
+import { registerSyncTools } from "./tools/sync.js";
+import { stopAllWatches } from "./lib/sync.js";
 import { registerScriptTools } from "./tools/scripts.js";
 import { registerSessionTools } from "./tools/session.js";
 import { registerInputTools } from "./tools/input.js";
@@ -117,7 +119,8 @@ async function main(): Promise<void> {
         "place they mean, then `set_active_studio`. Do the same whenever they " +
         "mention their other place — never assume a switch.\n\n" +
         "Prefer the batch tools: `create`, `modify`, `delete`, `move` and " +
-        "`script_edit` all take arrays and apply as a single undo step, so one " +
+        "`script_edit` all take arrays. Instance batches are a single undo step " +
+        "(script source uses the script editor's own undo, per script), so one " +
         "call beats a loop of calls both in latency and in how cleanly the user " +
         "can revert your work. Reach for `execute_luau` only when no dedicated " +
         "tool fits — it is the escape hatch, not the default.",
@@ -145,6 +148,7 @@ async function main(): Promise<void> {
   registerWorldTools(context);
   registerGenerateTools(context);
   registerCharacterTools(context);
+  registerSyncTools(context);
   registerResources(context);
 
   /**
@@ -159,6 +163,8 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (stopping) return;
     stopping = true;
+    // Before the bridge closes, so the plugin hears the tracking stop.
+    stopAllWatches();
     // Said before the server goes down, because when this process is proxying
     // to another one, the owner is still there to hear it -- and telling it is
     // what makes the Studio console report the agent as finished at the moment
