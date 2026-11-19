@@ -66,6 +66,7 @@ function run(attempts) {
 
   const harness = `
 local calls = 0
+local overlayDestroyed = false
 local services = {
   CaptureService = {
     CaptureScreenshot = function(_, callback)
@@ -75,11 +76,26 @@ local services = {
     end,
   },
   RunService = { PreRender = { Wait = function() end } },
+  Players = { LocalPlayer = { FindFirstChildOfClass = function() return nil end } },
+}
+workspace = { CurrentCamera = nil, GetDescendants = function() return {} end }
+Instance = {
+  new = function(className)
+    return {
+      ClassName = className,
+      Destroy = function()
+        if className == "ScreenGui" then overlayDestroyed = true end
+      end,
+    }
+  end,
 }
 game = { GetService = function(_, name) return services[name] end }
 local reported
 local remote = { FireServer = function(_, payload) reported = payload end }
-script = { WaitForChild = function() return remote end }
+script = {
+  WaitForChild = function() return remote end,
+  GetAttribute = function() return "" end,
+}
 task = { wait = function() return 0.05 end }
 -- Wrapped so the relay's own early \`return\`s (on failure) only leave this
 -- function, not the whole harness -- the relay is a standalone chunk in
@@ -89,6 +105,7 @@ task = { wait = function() return 0.05 end }
 ${relay}
 end)()
 assert(reported ~= nil, "relay never reported")
+assert(overlayDestroyed, "overlay was not destroyed")
 if reported.ok then
   print("ok|" .. tostring(reported.contentId))
 else

@@ -4,9 +4,13 @@
 -- was used in the call and never declared, so every target="client" run failed
 -- before reaching the player.
 local calls = {}
+local attached = {}
 local ClientRelay = {
 	playerFor = function(name)
 		return { Name = name or "Player1" }
+	end,
+	attachRuntime = function(relay, player)
+		table.insert(attached, { relay = relay, player = player })
 	end,
 	run = function(player, name, source, attributes, timeout, prepare)
 		table.insert(calls, {
@@ -21,6 +25,8 @@ local ClientRelay = {
 	end,
 }
 local Runtime = { run = function() return { ok = true } end }
+local Results = { read = function() return { ok = true } end }
+local Context = { of = function() return "edit" end }
 
 local game = { GetService = function() return {} end }
 -- Setting `.Parent` on one of these appends it to the parent's `children`, which

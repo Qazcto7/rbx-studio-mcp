@@ -22,6 +22,7 @@
  *   --playtest   also start a playtest and exercise character, input and the client tools
  *   --no-camera  leave the viewport camera alone (skips the focus and camera checks)
  */
+import { nativeBinary } from "./lib/native.mjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { dirname, join, resolve } from "node:path";
@@ -40,8 +41,8 @@ const TERRAIN_AT = "5000, 0, 5000";
 const client = new Client({ name: "test-live-tools", version: "0" });
 await client.connect(
   new StdioClientTransport({
-    command: process.execPath,
-    args: [join(root, "dist", "index.js"), ...(flag("port") ? ["--port", flag("port")] : [])],
+    command: nativeBinary(),
+    args: [...(flag("port") ? ["--port", flag("port")] : [])],
     stderr: "inherit",
   }),
 );
@@ -198,10 +199,12 @@ try {
 
   const revision = /rev ([0-9a-f-]+)/.exec(await call("script_read", { paths: [`${FIXTURE}.Mod`] }).then((reply) => reply.text))?.[1];
   await ok("script_edit: find and replace with a revision", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, find: "return a + b", replace: "return a + b + 0", revision }] });
-  await ok("script_edit: a line range", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, startLine: 2, endLine: 2, replacement: "function M.add(a, b) -- edited" }] });
+  const fresh = async () => /rev ([0-9a-f-]+)/.exec(await call("script_read", { paths: [`${FIXTURE}.Mod`] }).then((reply) => reply.text))?.[1];
+  await refuses("script_edit: a line range without a revision", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, startLine: 2, endLine: 2, replacement: "x" }] }, /NEEDS_REVISION/);
+  await ok("script_edit: a line range", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, startLine: 2, endLine: 2, replacement: "function M.add(a, b) -- edited", revision: await fresh() }] });
   await refuses("script_edit: a stale revision", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, source: "return {}", revision }] }, /STALE_SCRIPT/);
   await refuses("script_edit: text that is not there", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, find: "zzz-absent", replace: "x" }] }, /NO_MATCH/);
-  await refuses("script_edit: a line past the end", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, startLine: 99, endLine: 99, replacement: "x" }] }, /BAD_RANGE/);
+  await refuses("script_edit: a line past the end", "script_edit", { edits: [{ path: `${FIXTURE}.Mod`, startLine: 99, endLine: 99, replacement: "x", revision: await fresh() }] }, /BAD_RANGE/);
   await ok("script_read: sees the edit", "script_read", { paths: [`${FIXTURE}.Mod`] }, /edited/);
 
   await ok("geometry: union", "geometry", { op: "union", path: `${FIXTURE}.U1`, with: [`${FIXTURE}.U2`], name: "Unioned" }, /Unioned/);

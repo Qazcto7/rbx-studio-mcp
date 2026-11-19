@@ -14,6 +14,14 @@ local Selection = game:GetService("Selection")
 local Commands = require(script.Commands)
 local Config = require(script.Config)
 local Console = require(script.Console)
+local Backdrop = require(script.Backdrop)
+local Palette = require(script.Palette)
+Backdrop.setEnabled(plugin:GetSetting("background") ~= false)
+-- The saved theme, before anything is drawn. An unknown id keeps the default.
+local savedTheme = plugin:GetSetting("theme")
+if typeof(savedTheme) == "string" then
+	Palette.use(savedTheme)
+end
 local Dispatch = require(script.Dispatch)
 local History = require(script.History)
 local LogBuffer = require(script.LogBuffer)
@@ -21,7 +29,6 @@ local ClientRelay = require(script.ClientRelay)
 local Mirror = require(script.Mirror)
 local Phrase = require(script.Phrase)
 local ScriptEdit = require(script.ScriptEdit)
-local Themes = require(script.Themes)
 local Transport = require(script.Transport)
 local Debug = require(script.handlers.Debug)
 local Assets = require(script.handlers.Assets)
@@ -46,12 +53,12 @@ local Anim = require(script.handlers.Anim)
 local Api = require(script.handlers.Api)
 local Scripts = require(script.handlers.Scripts)
 local Sync = require(script.handlers.Sync)
+local Analysis = require(script.handlers.Analysis)
 local Session = require(script.handlers.Session)
 
 local SETTING_PORT = "port"
 local SETTING_AUTOCONNECT = "autoConnect"
 local SETTING_FORCE_POLL = "forcePoll"
-local SETTING_THEME = "theme"
 local SETTING_WIDGET_OPEN = "widgetOpen"
 --[[
 	Whether the panel is allowed to come up on its own at all.
@@ -67,6 +74,21 @@ local SETTING_WIDGET_OPEN = "widgetOpen"
 ]]
 local SETTING_AUTO_OPEN = "autoOpen"
 local SETTING_PLAYTESTS = "playtestsEnabled"
+-- Whether the panel opens during a playtest. Absent means off: Studio hides the
+-- editor's panel while a test runs, and a second one appearing over the game
+-- was the complaint. `playpanel on` turns it on.
+local SETTING_PLAY_PANEL = "playPanel"
+-- Where that playtest panel goes: "float" (at the editor panel's size) or a
+-- dock side. Set by `playpanel left|right|bottom|float`. Absent means float.
+local SETTING_PLAY_DOCK = "playDock"
+local PLAY_DOCKS: { [string]: Enum.InitialDockState } = {
+	float = Enum.InitialDockState.Float,
+	left = Enum.InitialDockState.Left,
+	right = Enum.InitialDockState.Right,
+	bottom = Enum.InitialDockState.Bottom,
+}
+-- The constellation behind the log. Absent means on.
+local SETTING_BACKGROUND = "background"
 -- Whether sentences typed at the prompt are sent to an agent. Absent means off:
 -- it only turns on when the user runs `chat on`.
 local SETTING_CHAT = "chatEnabled"
@@ -150,37 +172,8 @@ end)
 
 Transport.setForcePoll(plugin:GetSetting(SETTING_FORCE_POLL) == true)
 
---[[
-	The console's colour preset, restored before anything is drawn.
-
-	Applied here rather than after mounting so the panel is built in the right
-	palette from the start -- restoring it afterwards would flash the default
-	theme for a frame on every Studio launch. An unknown id (a preset renamed,
-	or a setting written by a newer build) falls back to the default rather than
-	failing, which is `Themes.get`'s job.
-]]
-local storedTheme = plugin:GetSetting(SETTING_THEME)
-if typeof(storedTheme) == "string" then
-	Themes.use(storedTheme)
-end
-
---[[
-	Whether the restore above still has to be pushed into the console.
-
-	`Themes.use` moves the ACTIVE ID, and anything that reads the palette live
-	picks the change up for free -- which is why the prism cell came back on the
-	saved preset. `Console` does not read it live: it caches the palette in an
-	upvalue at module load, deliberately, so that forty read sites stay plain
-	field accesses. Module load happens at the `require` above, which is BEFORE
-	this line, so the cache held the default while the id said otherwise, and a
-	reload came back as the saved prism drawn in the default's colours.
-
-	It cannot simply be applied here either -- the console is not mounted yet.
-	So it is remembered and applied the moment it can be, right after mounting.
-]]
-local themeNeedsApplying = typeof(storedTheme) == "string" and Themes.activeId() == storedTheme
-
 Session.register()
+ClientRelay.register()
 Discover.register()
 Debug.register()
 Instances.register()
@@ -199,6 +192,7 @@ Exec.register()
 Viewport.register()
 Scripts.register()
 Sync.register()
+Analysis.register()
 Input.register()
 Device.register()
 Data.register()
@@ -221,7 +215,9 @@ local toolbar = plugin:CreateToolbar("rbx-studio")
 local button = toolbar:CreateButton(
 	"rbx-studio",
 	"Show the rbx-studio console",
-	"rbxassetid://125390773465346"
+	-- The image inside the uploaded Decal (134859918773857), not the Decal:
+	-- a button needs the texture id, and the Decal id draws nothing.
+	"rbxassetid://116122341825117"
 )
 button.ClickableWhenViewportHidden = true
 
@@ -302,9 +298,27 @@ end
 	Separate ids give each its own memory, so a playtest can never write over
 	where the user put the editor's panel.
 ]]
+--[[
+	Measured again (Studio 0.746): the editor's panel keeps its dock across a
+	playtest. Studio hides it while the test runs (still Enabled, still sized)
+	and puts it back in the same tab on Stop. A test's own panel cannot take
+	that dock: sharing the editor's id gave a 0x0 widget that RequestRaise and
+	an Enabled toggle could not show. So ids stay separate, and the test's
+	panel is off unless `playpanel on`.
+
+	Measured once more (Studio 0.747): a playtest panel's id must be NEW every
+	test. Whatever the user does with it during a test, Studio saves that id's
+	layout as a small 248x326 float, and from then on restores it -- ignoring
+	the dock side and size asked for. That was the "undocks / shrinks on Play"
+	bug. A fresh id is never restored, so the side and size below apply.
+]]
 local widgetId = "StudioMCP_Console"
 if not RunService:IsEdit() then
-	widgetId = if RunService:IsServer() then "StudioMCP_Console_Server" else "StudioMCP_Console_Client"
+	widgetId = string.format(
+		"StudioMCP_Console_%s_%s",
+		if RunService:IsServer() then "Server" else "Client",
+		HttpService:GenerateGUID(false)
+	)
 end
 
 --[[
@@ -324,18 +338,27 @@ end
 	properly -- is untouched.
 ]]
 local isPlayClient = not RunService:IsEdit() and not RunService:IsServer()
-local openOnLoad = wantOpen and not isPlayClient
+local playPanel = plugin:GetSetting(SETTING_PLAY_PANEL) == true
+--[[
+	With `playpanel on`, both playtest halves open their panel. Play shows the
+	CLIENT view, so opening only the server's left the panel looking closed the
+	moment Play was pressed; the client's panel mirrors the server's log.
+]]
+local openOnLoad = if RunService:IsEdit() then wantOpen else playPanel
+local storedDock = plugin:GetSetting(SETTING_PLAY_DOCK)
+local playDock = if typeof(storedDock) == "string" and PLAY_DOCKS[storedDock] then storedDock else "float"
 
 local widget = plugin:CreateDockWidgetPluginGuiAsync(
 	widgetId,
 	DockWidgetPluginGuiInfo.new(
 		-- Only ever used the first time an id is seen, before Studio has a
-		-- layout of its own to restore.
-		Enum.InitialDockState.Float,
+		-- layout of its own to restore -- which, for a playtest's fresh id, is
+		-- every time.
+		if RunService:IsEdit() then Enum.InitialDockState.Float else PLAY_DOCKS[playDock],
 		openOnLoad,
-		-- Left off so the saved layout -- where the user docked the panel --
-		-- survives. See above.
-		false,
+		-- Off in the editor, so the saved open state survives. On in a
+		-- playtest, where `playpanel` decides.
+		not RunService:IsEdit(),
 		floatWidth,
 		floatHeight,
 		360,
@@ -475,7 +498,22 @@ if RunService:IsEdit() then
 		return true
 	end
 
-	widget:GetPropertyChangedSignal("AbsoluteSize"):Connect(persistSize)
+	--[[
+		Debounced. AbsoluteSize changes on every pixel of a drag, and each
+		SetSetting rewrites the plugin's whole settings file on disk -- dozens of
+		writes a second for as long as the user is resizing. Only the size they
+		let go at is worth keeping.
+	]]
+	local resizeGeneration = 0
+	widget:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		resizeGeneration += 1
+		local mine = resizeGeneration
+		task.delay(0.5, function()
+			if mine == resizeGeneration then
+				persistSize()
+			end
+		end)
+	end)
 
 	--[[
 		Seed from the size Studio has already restored, rather than waiting for
@@ -504,10 +542,11 @@ local function refreshMeta()
 	Console.setStatus(
 		currentStatus,
 		string.format(
-			"127.0.0.1:%d  %s  build %s",
+			-- Plain words: "sse" and a build hash meant nothing at a glance. The
+			-- build is still in the log and in `status`.
+			"Port %d \u{00B7} %s",
 			Config.getPort(),
-			Transport.getMode(),
-			Config.BUILD_ID
+			if Transport.getMode() == "sse" then "Live stream" else "Polling"
 		)
 	)
 	button:SetActive(currentStatus == "connected")
@@ -526,8 +565,7 @@ Console.mount(widget, {
 		Console.clear()
 	end,
 	onTheme = function(id)
-		plugin:SetSetting(SETTING_THEME, id)
-		Console.log("dim", string.format("theme: %s", id))
+		plugin:SetSetting("theme", id)
 	end,
 	onSubmit = function(line)
 		Commands.run(line)
@@ -557,9 +595,6 @@ Commands.setup({
 	savePort = function(value)
 		plugin:SetSetting(SETTING_PORT, value)
 	end,
-	saveTheme = function(id)
-		plugin:SetSetting(SETTING_THEME, id)
-	end,
 	autoOpen = function()
 		return autoOpen
 	end,
@@ -568,6 +603,30 @@ Commands.setup({
 		-- was just set rather than what the session started with.
 		autoOpen = value
 		plugin:SetSetting(SETTING_AUTO_OPEN, value)
+	end,
+	playPanel = function()
+		return playPanel
+	end,
+	saveTheme = function(id)
+		plugin:SetSetting("theme", id)
+	end,
+	background = function()
+		return Backdrop.isEnabled()
+	end,
+	saveBackground = function(value)
+		Backdrop.setEnabled(value)
+		plugin:SetSetting(SETTING_BACKGROUND, value)
+	end,
+	savePlayPanel = function(value)
+		playPanel = value
+		plugin:SetSetting(SETTING_PLAY_PANEL, value)
+	end,
+	playDock = function()
+		return playDock
+	end,
+	savePlayDock = function(value)
+		playDock = value
+		plugin:SetSetting(SETTING_PLAY_DOCK, value)
 	end,
 	chat = function()
 		return chat
@@ -589,13 +648,6 @@ Console.setPromptChat(chat)
 Sync.setup(function(level, message, detail)
 	Console.log(level :: any, message, detail)
 end)
-
--- The saved preset, now that there is something to paint. Done immediately
--- after mounting and before the first line is logged, so nothing is ever drawn
--- in the wrong palette.
-if themeNeedsApplying then
-	Console.applyTheme()
-end
 
 --[[
 	Keeps the prompt row showing what Studio has selected.
@@ -710,10 +762,12 @@ elseif Mirror.isPlaytestClient() then
 		if kind == "log" then
 			local level, message, detail = arguments[1], arguments[2], arguments[3]
 			if typeof(level) == "string" and typeof(message) == "string" then
+				local ms = arguments[4]
 				Console.log(
 					level :: any,
 					message,
-					if typeof(detail) == "string" then detail else nil
+					if typeof(detail) == "string" then detail else nil,
+					if typeof(ms) == "number" then ms else nil
 				)
 			end
 		elseif kind == "beginCall" then
@@ -783,7 +837,14 @@ local function onCommand(id: string, op: string, params: { [string]: any }?, dea
 	-- A sync op can also ask to be quiet: `watch` runs the same scans a manual
 	-- sync does, and logging each would print a heartbeat. What a watch
 	-- actually changes is still logged, by `sync.apply` and `sync.log`.
-	if QUIET[op] or (string.sub(op, 1, 5) == "sync." and params ~= nil and params.quiet == true) then
+	-- The server's own polling while a stop settles is not an agent call: it
+	-- printed five or six "Wait for the playtest to stop" rows per stop.
+	local stopPoll = op == "playtest.control" and params ~= nil and params.waitingForStop == true
+	if
+		QUIET[op]
+		or stopPoll
+		or (string.sub(op, 1, 5) == "sync." and params ~= nil and params.quiet == true)
+	then
 		task.spawn(function()
 			Transport.sendResult(Dispatch.invoke(id, op, params, deadlineMs))
 		end)
@@ -809,7 +870,7 @@ local function onCommand(id: string, op: string, params: { [string]: any }?, dea
 			announced, so the bar on the trace lost the name it was supposed to
 			carry. A microsecond is not worth an ordering hazard.
 		]]
-		Console.beginCall(title, Phrase.kindOf(op))
+		Console.beginCall(title, Phrase.kindOf(op, params))
 
 		local result = Dispatch.invoke(id, op, params, deadlineMs)
 		local milliseconds = (os.clock() - startedAt) * 1000
@@ -831,13 +892,14 @@ local function onCommand(id: string, op: string, params: { [string]: any }?, dea
 		Console.recordCall(result.ok, milliseconds)
 
 		if result.ok then
-			Console.log("reply", title, elapsed)
+			Console.log("reply", title, elapsed, milliseconds)
 		else
 			local err = result.error
 			Console.log(
 				"error",
 				string.format("%s failed: %s", title, if err then err.code else "unknown"),
-				elapsed
+				elapsed,
+				milliseconds
 			)
 			if err and err.message then
 				Console.log("dim", "   " .. err.message)
@@ -886,8 +948,21 @@ local function onEvent(event: { [string]: any })
 			event.message,
 			if typeof(event.detail) == "string" then event.detail else nil
 		)
+	elseif event.event == "refused" and typeof(event.title) == "string" then
+		--[[
+			A call the server turned down before it reached Studio -- a misspelt
+			property, a bad argument. Nothing ran here, so without this the
+			panel would show no trace of the failure at all.
+		]]
+		local code = if typeof(event.code) == "string" then event.code else "refused"
+		Console.beginCall(event.title, "read")
+		Console.recordCall(false, 0)
+		Console.log("error", string.format("%s refused", event.title), code)
 	elseif event.event == "agent-run" then
 		Console.setPromptBusy(event.state == "running")
+		if event.state ~= "running" then
+			Console.endTurn()
+		end
 	elseif event.event == "peer" and typeof(event.op) == "string" then
 		--[[
 			A command another session on this place just finished.
@@ -908,12 +983,12 @@ local function onEvent(event: { [string]: any })
 		local ok = event.ok == true
 		local detail = string.format("%s %.0fms", peerTag(event.from), milliseconds)
 
-		Console.beginCall(title, Phrase.kindOf(event.op))
+		Console.beginCall(title, Phrase.kindOf(event.op, params))
 		Console.recordCall(ok, milliseconds)
 		if ok then
-			Console.log("reply", title, detail)
+			Console.log("reply", title, detail, milliseconds)
 		else
-			Console.log("error", string.format("%s failed", title), detail)
+			Console.log("error", string.format("%s failed", title), detail, milliseconds)
 		end
 	end
 end
@@ -946,6 +1021,8 @@ end)
 
 plugin.Unloading:Connect(function()
 	ClientRelay.stopDiagnostics()
+	ClientRelay.stopReads()
+	Analysis.stop()
 	Transport.stop()
 end)
 

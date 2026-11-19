@@ -1016,9 +1016,9 @@ function Anim.play(params: { [string]: any }): { [string]: any }
 		Speed = if typeof(params.speed) == "number" then params.speed else nil,
 	}, PLAY_TIMEOUT, function(relay)
 		-- Paths is the only dependency the client script itself requires, but
-		-- Paths in turn requires Dispatch (as a sibling, `script.Parent.Dispatch`)
-		-- for its own failure reporting, so both come along.
-		for _, name in { "Paths", "Dispatch" } do
+		-- Paths in turn requires Dispatch and Handles (as siblings,
+		-- `script.Parent.*`), so all three come along.
+		for _, name in { "Paths", "Dispatch", "Handles" } do
 			local copy = script.Parent.Parent[name]:Clone()
 			copy.Parent = relay
 		end
@@ -1056,7 +1056,7 @@ function Anim.stopPlay(params: { [string]: any }): { [string]: any }
 		Mode = "stop",
 		Rig = if typeof(params.rig) == "string" then params.rig else nil,
 	}, PLAY_TIMEOUT, function(relay)
-		for _, name in { "Paths", "Dispatch" } do
+		for _, name in { "Paths", "Dispatch", "Handles" } do
 			local copy = script.Parent.Parent[name]:Clone()
 			copy.Parent = relay
 		end

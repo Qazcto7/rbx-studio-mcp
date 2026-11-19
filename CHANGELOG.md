@@ -6,7 +6,7 @@ What changed in each release, written for people using the server rather than fo
 
 Fixes for running Studio under Wine/Vinegar on Linux, found while using the server there day to day.
 
-This fork is merged with upstream 0.8.6 but **keeps the `animation` tool**, which upstream removed in 0.8.0 without a stated reason: `read`, `build`, `preview` and this fork's `play` are all still here.
+This fork is merged with upstream 1.2.5 (native Rust server) and **keeps the `animation` tool** (36 tools total), which upstream removed in 0.8.0: `read`, `build`, `preview`, `play` and `stop`, along with all Wine/Vinegar Linux reliability fixes ported into the Rust server (`server/src/`) and Luau plugin (`plugin/src/`).
 
 ### Fixed
 - **Stale plugin on Linux.** `--install-plugin` now finds Studio's plugins folder under Vinegar (native and Flatpak) and Wine prefixes and installs into every one it finds, instead of exiting on Linux. `STUDIO_MCP_PLUGINS_DIR` overrides the search. `doctor` checks each folder against this package's build id and flags a stale or truncated file.
@@ -50,6 +50,221 @@ This fork is merged with upstream 0.8.6 but **keeps the `animation` tool**, whic
 - `execute_luau target="client"` takes `settleSeconds`, which keeps the relay alive after the chunk returns so `task.spawn` threads can finish, and warns when code spawns threads without it.
 - `create`/`modify` warn when a bare-hash id from `animation op="build"` is written to an `AnimationId`: those ids are preview-only, and loading one in a playtest breaks the character's whole Animator.
 - `playtest op="multiplayer"` (and upstream 0.8.2's `op="addPlayers"`, which starts extra clients the same way) is refused on Linux unless `force: true` (or `STUDIO_MCP_ALLOW_MULTIPLAYER=1`); it is unreliable under Wine and has crashed Studio. A `play` that is slow to start now says to poll `state` rather than send it again.
+
+## 1.2.5
+
+### Added
+
+- `sync` checks Luau before pushing (luau-lsp with Roblox types). A file with a syntax error is held back; type errors are reported.
+- Deprecated API warnings: classes, properties and functions, with the replacement. Typos get a "did you mean".
+- Findings show in Studio's Script Analysis window and as underlines, without repeating what Studio already flags.
+- `sync op="check"` checks the folder without syncing; `check: "strict" | "off"` sets how much is reported.
+
+### Changed
+
+- Dependencies updated; Rust 1.100.0.
+
+## 1.2.2
+
+### Fixed
+
+- The toolbar icon loads.
+- `npm publish` in the repository publishes the platform packages first.
+
+## 1.2.1
+
+### Added
+
+- New panel design with six animated themes: Nebula, Ember, Tide, Galaxy, Aurora, Monolith. Pick one with the header dots or `theme <name>`; `background off` stops the animation.
+- The background reacts to calls and clicks.
+- Grouped rows: command output, agent steps, call bursts and reconnects fold under one row.
+- Per-game Open Cloud permissions: only reading is on until you run `allow <group>` (`assets`, `data`, `edit`, `money`, `players`).
+- `playpanel on|off|left|right|bottom|float`: show the panel during playtests, docked or floating.
+- Refused calls show in the panel as a red row.
+- New plugin icon.
+
+### Changed
+
+- **Breaking:** uploads, data store writes, publishing, products and bans now need `allow <group>` once per game.
+- Server rewritten in Rust: one native binary per platform, installed through npm as before. Starts in ~25 ms (was 450 ms), uses ~14 MB (was 95 MB).
+- The plugin is built into the server; `--install-plugin` no longer needs Node.
+- Agent replies read as one block, tool calls as short phrases.
+- Test Teleports: agents no longer ask which place to use, and calls to the old server name the new one.
+
+### Fixed
+
+- The playtest panel no longer undocks or shrinks on every test after the first.
+- Stopping a playtest no longer fills the panel with "Wait for the playtest to stop" rows.
+- Typed lines no longer replay their animation.
+- Switching theme no longer cuts off running animations.
+- Monolith clicks add a beam instead of restarting the running one.
+- `api describe` finds plugin-only classes such as `DockWidgetPluginGui`.
+- Command menu and hover fixes; the saved theme is fully applied after a Studio reload.
+
+### Removed
+
+- The previous themes, the `visuals` command and the activity band.
+
+## 1.0.6
+
+### Changed
+
+- Shorter README. Install commands now register the server as `rbx-studio`, the name the rest of the project uses.
+
+### Fixed
+
+- Copilot CLI's allow flag used the wrong tool format. It now allows the server by name, as `rbx-studio` or `roblox-studio`.
+- `doctor` suggested an install command without the package's `@el4cteo/` scope.
+- `cloud` help described the key as for uploads only.
+
+## 1.0.5
+
+### Added
+
+- Hyperline, this month's special theme: the band becomes a live tunnel where every call is a light trail. Pick it from the amber-ringed dot or with `theme hyperline`.
+- `performance op="microprofile"`: captures MicroProfiler frames and ranks engine scopes on every thread, with frame times and what filled the worst frame. `export` saves a file for the MicroProfiler viewer. Uses Roblox's LibMP.
+- `collision op="cast"`: `shape="part"`, `margin`, `sizeGradient` and `visualize`.
+- A send button on the prompt.
+
+### Changed
+
+- Calls in a turn now show as stations on the thread, coloured by kind of work, and a finished turn ends with a cap. Latency bars match.
+- The status dot pulses while connected.
+- Writes refuse an ambiguous path with `AMBIGUOUS_PATH`, instead of changing the first of several same-named siblings. Reads still accept it.
+
+### Removed
+
+- Electro theme. A saved Electro or Sonar choice switches to Hyperline.
+
+### Fixed
+
+- `theme <unknown name>` switched to Lattice instead of reporting an error.
+- Block and sphere casts reported distance to the contact point rather than how far the shape travelled.
+- `execute_luau` with `resultFields` returned non-empty arrays as `[]`.
+- `api` said a class didn't exist and then suggested the same name. It now says the class isn't enabled in this Studio.
+- Union and other geometry results listed wrong paths for consumed same-named parts.
+- `viewport op="focus"` returned unrounded numbers.
+
+### Performance
+
+- Resizing the panel no longer rewrites the settings file on every pixel.
+- Live sync polls no longer pile up while Studio is busy.
+
+## 1.0.0
+
+### Added
+
+- New panel design, Threadline. A line you type opens a thread, and every call and reply it causes hangs under it. Each call row shows a small latency bar. The activity band is one row, 18px shorter, and shows a live timer for the running call. The header uses icon buttons, and a row of theme dots replaces the theme drawer on the right edge.
+- Electro theme, which replaces Sonar: a charged core with lightning arcs that strike faster as the session works. A saved Sonar choice switches to Electro.
+- 18 more agents for `chat on`: Kimi Code, Cline, Kilo Code, Auggie, Qoder, Continue, Kiro, Mistral Vibe, Grok CLI, OpenHands, Hermes, OpenClaw, Warp Oz, Rovo Dev, Forge, pi, Letta Code and Trae Agent. That makes 31. The new adapters follow each vendor's documentation and haven't all been run yet, so please report any that misbehave.
+- `terrain op="materials"` lists, sets and resets custom terrain material slots (Custom Terrain Materials, launched Oct 2026).
+- `audio op="speech"` turns text into voice-line audio assets (Studio beta, Oct 2026).
+- `universe op="logs"` shows server stack frames as script paths and line numbers that `script_read` can open, when Roblox provides them.
+
+### Changed
+
+- History bars slide in and grow in every theme, instead of jumping.
+- The activity band stops redrawing while the panel is closed, and redraws at 15fps once the session has gone quiet.
+- Dependencies updated (MCP SDK 1.32.2), with 4 security fixes in transitive dependencies.
+
+### Fixed
+
+- Long log lines no longer run past the panel's right edge, under the scrollbar.
+
+## 0.9.5
+
+### Added
+
+- `viewport op="uisnap"`: snapshot a UI's layout, colours, fonts, text, images and modifiers, then call again with `compareTo` to see what was added, removed or changed, property by property. Works on the playtest client too.
+- `playtest` warns when Workspace is large enough to make Studio 743+ freeze for a minute or more on Stop, names the heaviest children and AnimSaves, and waits the freeze out instead of reporting a failed stop.
+
+### Changed
+
+- Playtest screenshots now show BillboardGuis and ProximityPrompts, which Roblox's capture API leaves out. They are redrawn for the one frame of the shot; the caption says how many.
+- `script_edit` requires `revision` for line-range and whole-source edits (`NEEDS_REVISION`), and for every live edit. find/replace still works without it.
+- `script_create` returns each new script's `rev`, so a line edit can follow without a read.
+- `debug op="collisions"` ranks and filters by impact speed along the contact normal (`maxImpact`). Sliding contact no longer counts as a hard hit; total speed is still `maxSpeed`.
+- Dependencies updated (zod 4.6.7).
+
+### Fixed
+
+- `viewport op="ui"` no longer walks every pair of elements in large interfaces; the overlap check compares siblings only, within its cap.
+
+## 0.9.2
+
+### Added
+
+- `debug op="collisions"`: what a part (or every part in a model) hit during a playtest, with contact point, normal, impact speed and area, hardest first. Reads the server, or the player's own simulation with `target="client"`.
+
+### Changed
+
+- Dependencies updated.
+
+## 0.9.1
+
+### Added
+
+- Stop button beside the prompt while an agent runs. The `stop` command still works but is hidden from the menu.
+- Three new themes: Sonar, Ember and Pendulum, replacing Void, Nebula and Blueprint.
+- The console log is one row per entry: errors and warnings get a coloured bar, rows light up under the pointer, and a "latest" button appears when you scroll up.
+
+### Changed
+
+- Theme picker redone: larger previews, a clear marker for the active theme, hover highlight.
+- Dim text is brighter in every theme, and the Aurora, Phosphor, Observatory and Orbit animations are refreshed.
+- The log no longer re-renders every row on each new line.
+- Dependencies updated (MCP SDK 1.32.1).
+
+### Fixed
+
+- The server stays up after a stray error, and always releases the port on shutdown.
+- A plugin that disconnects during connection no longer leaves a dead session behind.
+- Sorting same-named siblings on a client no longer evicts handles you already hold.
+- Error messages name same-named siblings by index (`Twin[2]`), not just `Twin`.
+- Internal review notes are no longer shipped in the npm package.
+
+## 0.9.0
+
+### Added
+
+- `tree`, `inspect`, `find`, `viewport ui/raycast` and `performance snapshot` take `target="client"` and optional `player`, so they read the running player's view, UI and render counters.
+- `viewport op="pick"`: a point on the screen (normalized `x` / `y`) to the instance under it, using the editor or actual-client camera.
+- `handles=true` on discovery returns references usable in place of paths. They survive renames and moves, distinguish same-named instances, and refuse stale or wrong-context use.
+- Clipped successful `execute_luau` results return a `resultId`: page tables or strings, read nested values and select row fields without running the code again.
+- `debug op="watch"`: property, attribute and direct-child changes over a short window, in Studio or the actual client, with initial values, old/new values, times and explicit drop counts.
+
+### Changed
+
+- Playtest `screenshot path=` crops to the selected client's instance, including UI that exists only on that client.
+- Studio and client Luau replies say which context, VM and permission identity ran the code.
+
+### Fixed
+
+- `Font="Code"` is converted as `Enum.Font` instead of being mistaken for a `FontFace` value.
+- Same-named client siblings keep a stable path order when Roblox refuses `GetDebugId`.
+- A failed `viewport raycast` reports the error instead of saying nothing was hit.
+- ScreenGui crops and UI bounds account for the GUI inset with either `IgnoreGuiInset` setting.
+- Clipped Luau previews keep Unicode characters intact, and oversized printed lines say how much output was omitted.
+
+## 0.8.7
+
+### Added
+- `sync` writes a `sourcemap.json`, so luau-lsp resolves requires between synced scripts.
+- `universe op="analytics"`: the game's metrics over a date range (players, revenue, retention, crashes, frame rate), optionally split by platform, country and more.
+- `universe op="events"`, `"schedule"`, `"cancel"`: list, create, reschedule and cancel the game's scheduled events.
+- `script_edit target="live"` takes `revision` (the `rev` `script_read target="live"` now prints) and refuses to overwrite a script that was published since.
+- Long calls tell the client they are still working, so clients with a short tool timeout (such as Codex) stop giving up on `generate`, live Luau, uploads and playtests that are fine.
+
+### Changed
+- Dependencies updated (MCP SDK 1.32).
+- Open Cloud calls repeat a rate-limited request (and a failed read) after the wait Roblox asks for, up to twice.
+- Live Luau runs, uploads and place operations are noticed as finished sooner: checks start at 0.4s, not 2s.
+
+### Fixed
+- `script_edit`: line edits starting on the same line (an insert and a replace) now apply in a fixed order; before, one order could hit the wrong lines.
+- `script_read target="live"` could not reach scripts past the first 100 in a folder, and a cut listing did not say so.
+- `execute_luau target="live"` returned only the first page of the script's output.
+- `sync watch` missed changes to folders whose names contain a dot.
 
 ## 0.8.6
 

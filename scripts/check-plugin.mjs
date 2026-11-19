@@ -122,9 +122,10 @@ const ENGINE_GLOBALS = new Set([
   // Roblox datatypes
   "Axes", "BrickColor", "CFrame", "Color3", "ColorSequence", "ColorSequenceKeypoint", "Content", "DateTime",
   "DockWidgetPluginGuiInfo", "Faces", "FloatCurveKey", "Font", "NumberRange", "NumberSequence",
-  "NumberSequenceKeypoint", "OverlapParams", "PathWaypoint", "PhysicalProperties", "Random", "Ray",
-  "RaycastParams", "Rect", "Region3", "Region3int16", "RotationCurveKey", "SharedTable", "TweenInfo", "UDim",
-  "UDim2", "Vector2", "Vector2int16", "Vector3", "Vector3int16", "CatalogSearchParams", "RaycastResult",
+  "NumberSequenceKeypoint", "OverlapParams", "Path2DControlPoint", "PathWaypoint", "PhysicalProperties",
+  "Random", "Ray", "RaycastParams", "Rect", "Region3", "Region3int16", "RotationCurveKey",
+  "SecurityCapabilities", "SharedTable", "TweenInfo", "UDim", "UDim2", "Vector2", "Vector2int16",
+  "Vector3", "Vector3int16", "CatalogSearchParams", "RaycastResult",
 ]);
 
 const analyser = locateLuau("LUAU_ANALYZE", ["luau-analyze.exe", "luau-analyze"]);
@@ -295,13 +296,15 @@ const missingClones = [];
     ]),
   );
   const requiresOf = (name) =>
-    [...(modules.get(name) ?? "").matchAll(/require\(script\.Parent\.(\w+)\)/g)].map((m) => m[1]);
+    [...(modules.get(name) ?? "").matchAll(/require\(script(?:\.Parent){1,2}\.([\w.]+)\)/g)]
+      .map((m) => m[1].replace(/^Handlers\./, "handlers.").replaceAll(".", "/"));
 
   for (const [where, source] of modules) {
     for (const list of source.matchAll(
-      /for _, name in \{([^}]*)\} do\s*local copy = script\.Parent\.Parent\[name\]:Clone\(\)/g,
+      /for _, name in \{([^}]*)\} do\s*local copy = script(?:\.Parent){1,2}\[name\]:Clone\(\)/g,
     )) {
       const cloned = new Set([...list[1].matchAll(/"(\w+)"/g)].map((m) => m[1]));
+      if (source.includes("script.Parent.handlers.Discover:Clone()")) cloned.add("handlers/Discover");
       const needed = new Set();
       const pending = [...cloned];
       while (pending.length > 0) {

@@ -41,7 +41,11 @@ const suites = [
   { module: "plugin/src/Commands.luau", test: "tests/playtests-commands.luau", prelude: "tests/playtests-stub.luau", dependency: "plugin/src/handlers/Playtest.luau" },
   { module: "plugin/src/Commands.luau", test: "tests/chat-commands.luau", prelude: "tests/playtests-stub.luau", dependency: "plugin/src/handlers/Playtest.luau" },
   { module: "plugin/src/RemoteTrace.luau", test: "tests/remote-trace.luau", prelude: "tests/remote-trace-stub.luau" },
-  { module: "plugin/src/ExecRuntime.luau", test: "tests/exec-runtime.luau", prelude: "tests/exec-runtime-stub.luau" },
+  { module: "plugin/src/ExecRuntime.luau", test: "tests/exec-runtime.luau", preludes: ["tests/json-stub.luau", "tests/exec-runtime-stub.luau"], dependencies: [{ name: "Results", path: "plugin/src/Results.luau" }] },
+  { module: "plugin/src/Results.luau", test: "tests/results.luau", preludes: ["tests/json-stub.luau", "tests/results-stub.luau"] },
+  { module: "plugin/src/Paths.luau", test: "tests/paths.luau", preludes: ["tests/json-stub.luau", "tests/paths-stub.luau"], dependencies: [{ name: "Handles", path: "plugin/src/Handles.luau" }] },
+  { module: "plugin/src/Collisions.luau", test: "tests/collisions.luau", prelude: "tests/collisions-stub.luau" },
+  { module: "plugin/src/Watch.luau", test: "tests/watch.luau", preludes: ["tests/json-stub.luau", "tests/watch-stub.luau"] },
   { module: "plugin/src/ClientRelay.luau", test: "tests/client-relay.luau", prelude: "tests/client-relay-stub.luau" },
   { module: "plugin/src/handlers/Exec.luau", test: "tests/exec-client.luau", prelude: "tests/exec-client-stub.luau" },
   { module: "plugin/src/handlers/Anim.luau", test: "tests/anim.luau", prelude: "tests/anim-stub.luau" },
@@ -60,6 +64,8 @@ const suites = [
 const DISPATCH_STUB = `local Dispatch = {}
 function Dispatch.checkDeadline() end
 function Dispatch.deadline() return nil end
+Dispatch.__strict = false
+function Dispatch.strictPaths() return Dispatch.__strict end
 function Dispatch.fail(code, message, hint)
 \terror({ code = code, message = message, hint = hint }, 0)
 end
@@ -78,6 +84,7 @@ for (const suite of suites) {
   const bundle = [
     DISPATCH_STUB,
     suite.prelude ? readFileSync(join(root, suite.prelude), "utf8") : "",
+    ...(suite.preludes ?? []).map(path => readFileSync(join(root, path), "utf8")),
     // Real modules loaded as the module's own dependencies, not stubbed.
     ...(suite.dependencies ?? []).map(
       (dependency) =>
@@ -113,13 +120,14 @@ for (const suite of suites) {
 }
 
 // Embedded LocalScript bodies must compile too; the module compiler sees strings.
-for (const name of ["Exec", "Input", "Debug"]) {
-  const source = readFileSync(join(root, `plugin/src/handlers/${name}.luau`), "utf8");
-  const relay = source.match(/\[==\[([\s\S]*?)\]==\]/)?.[1];
-  if (!relay) throw new Error(`Missing ${name} relay`);
-  const path = join(mkdtempSync(join(tmpdir(), "studio-mcp-relay-")), "compile.luau");
-  writeFileSync(path, `local chunk, err = loadstring(${JSON.stringify(relay)})\nassert(chunk, err)\n`);
-  if (spawnSync(luau, [path], {stdio:"inherit"}).status !== 0) failures += 1;
+for (const file of ["handlers/Exec", "handlers/Input", "handlers/Debug", "handlers/Capture", "ClientRelay"]) {
+  const source = readFileSync(join(root, `plugin/src/${file}.luau`), "utf8");
+  for (const match of source.matchAll(/\[==\[([\s\S]*?)\]==\]/g)) {
+    const relay = match[1];
+    const path = join(mkdtempSync(join(tmpdir(), "studio-mcp-relay-")), "compile.luau");
+    writeFileSync(path, `local chunk, err = loadstring(${JSON.stringify(relay)})\nassert(chunk, err)\n`);
+    if (spawnSync(luau, [path], {stdio:"inherit"}).status !== 0) failures += 1;
+  }
 }
 
 process.exit(failures === 0 ? 0 : 1);

@@ -171,13 +171,107 @@ if report == nil then
 	return
 end
 
+-- Resolve in this camera/PlayerGui, never in the server or editor DataModel.
+local region = nil
+if relay:GetAttribute("Path") ~= "" then
+	local resolved, bounds = pcall(function()
+		local reference = relay:WaitForChild("Runtime", 10)
+		assert(reference, "Runtime reference did not replicate")
+		local deadline = os.clock() + 10
+		while not reference.Value and os.clock() < deadline do task.wait() end
+		assert(reference.Value, "Runtime module did not replicate")
+		return require(reference.Value).call("capture.region", { path = relay:GetAttribute("Path") })
+	end)
+	if not resolved then
+		report:FireServer({ ok = false, reason = if typeof(bounds) == "table" then bounds.message else tostring(bounds) })
+		return
+	end
+	region = bounds.region
+end
+
+-- CaptureScreenshot leaves out every BillboardGui -- including the default
+-- ProximityPrompt, which is one -- while drawing ScreenGuis normally (measured,
+-- and the same gap Roblox's own MCP has: DevForum topic 4736693). So for the
+-- one frame of the shot, each billboard on screen is redrawn into a ScreenGui
+-- at the rect the engine draws it at, and removed straight after. Scripts in
+-- the copies are stripped so nothing runs twice. Depth is not reproduced: a
+-- billboard behind a wall is drawn anyway, which the caption says.
+local overlay = nil
+local billboards = 0
+local billboardError = nil
+local overlayOk, overlayErr = pcall(function()
+	local camera = workspace.CurrentCamera
+	local player = game:GetService("Players").LocalPlayer
+	overlay = Instance.new("ScreenGui")
+	overlay.Name = "MCPBillboardOverlay"
+	overlay.IgnoreGuiInset = true
+	overlay.ResetOnSpawn = false
+	-- Lowest, because billboards are drawn in the 3D pass, under every ScreenGui.
+	overlay.DisplayOrder = -2147483648
+	local function anchor(gui)
+		local subject = gui.Adornee or gui.Parent
+		if subject and subject:IsA("BasePart") then return subject.CFrame, subject.Size end
+		if subject and subject:IsA("Attachment") then return subject.WorldCFrame, Vector3.zero end
+		if subject and subject:IsA("Model") then return subject:GetBoundingBox() end
+		return nil, nil
+	end
+	local function redraw(gui)
+		if not gui:IsA("BillboardGui") or not gui.Enabled then return end
+		local frame, extents = anchor(gui)
+		local size = gui.AbsoluteSize
+		if not frame or size.X <= 0 or size.Y <= 0 then return end
+		local view = camera.CFrame
+		local world = frame.Position + gui.StudsOffsetWorldSpace + view:VectorToWorldSpace(gui.StudsOffset)
+			+ view:VectorToWorldSpace(gui.ExtentsOffset * extents / 2)
+		local point, visible = camera:WorldToViewportPoint(world)
+		if not visible then return end
+		if gui.MaxDistance > 0 and (view.Position - world).Magnitude > gui.MaxDistance then return end
+		local holder = Instance.new("Frame")
+		holder.BackgroundTransparency = 1
+		holder.Position = UDim2.fromOffset(point.X - size.X / 2 + gui.SizeOffset.X * size.X, point.Y - size.Y / 2 - gui.SizeOffset.Y * size.Y)
+		holder.Size = UDim2.fromOffset(size.X, size.Y)
+		holder.ClipsDescendants = gui.ClipsDescendants
+		for _, child in gui:GetChildren() do
+			if not child:IsA("BaseScript") then
+				local copied, copy = pcall(child.Clone, child)
+				if copied and copy then
+					for _, inner in copy:GetDescendants() do
+						if inner:IsA("BaseScript") then inner:Destroy() end
+					end
+					copy.Parent = holder
+				end
+			end
+		end
+		holder.Parent = overlay
+		billboards += 1
+	end
+	for _, root in { workspace, player:FindFirstChildOfClass("PlayerGui") } do
+		if root then
+			for _, item in root:GetDescendants() do
+				local drawn, why = pcall(redraw, item)
+				if not drawn and billboardError == nil then
+					billboardError = item:GetFullName() .. ": " .. tostring(why)
+				end
+			end
+		end
+	end
+	if billboards > 0 then
+		overlay.Parent = player:FindFirstChildOfClass("PlayerGui")
+	end
+end)
+if not overlayOk then
+	billboardError = tostring(overlayErr)
+end
+
 -- One rendered frame before the shot. The RemoteEvent is already a child of
 -- this script when it lands, so `WaitForChild` returns at once and the capture
 -- would otherwise happen on the frame the relay arrived -- which is the frame
 -- least likely to have finished drawing. Roblox's own working repro for
 -- CaptureService waits on PreRender first, and it costs a sixtieth of a second.
+-- Two with an overlay, so its first frame has been laid out and drawn.
 pcall(function()
 	RunService.PreRender:Wait()
+	if billboards > 0 then RunService.PreRender:Wait() end
 end)
 
 -- One try. Split out so a failure can be retried once instead of reported
@@ -212,6 +306,7 @@ if contentId == nil then
 	if retried ~= nil then
 		contentId = retried
 	else
+		if overlay then overlay:Destroy() end
 		-- Both failures are reported, not just the last -- see the equivalent
 		-- note in Capture.luau's takeScreenshot.
 		report:FireServer({
@@ -221,8 +316,9 @@ if contentId == nil then
 		return
 	end
 end
+if overlay then overlay:Destroy() end
 
-report:FireServer({ ok = true, contentId = contentId })
+report:FireServer({ ok = true, contentId = contentId, region = region, billboards = billboards, billboardError = billboardError })
 ]==]):gsub("CLIENT_CAPTURE_TIMEOUT", tostring(CAPTURE_TIMEOUT))
 
 --[[
@@ -343,11 +439,17 @@ function Capture.playtestId(params: { [string]: any }): { [string]: any }
 	local relay = Instance.new("LocalScript")
 	relay.Name = "MCPCaptureRelay"
 	relay.Source = CLIENT_SOURCE
+	relay.Archivable = false
+	relay:SetAttribute("MCPClientRelay", true)
+	relay:SetAttribute("Path", if params.rect then "" else params.path or "")
+	if not params.rect and params.path then
+		require(script.Parent.Parent.ClientRelay).attachRuntime(relay, player)
+	end
 	remote.Parent = relay
 
 	local answer: { [string]: any }? = nil
-	local connection = remote.OnServerEvent:Connect(function(_from, payload)
-		if typeof(payload) == "table" then
+	local connection = remote.OnServerEvent:Connect(function(from, payload)
+		if from == player and answer == nil and typeof(payload) == "table" then
 			answer = payload :: { [string]: any }
 		end
 	end)
@@ -377,7 +479,14 @@ function Capture.playtestId(params: { [string]: any }): { [string]: any }
 		Dispatch.fail("CAPTURE_REFUSED", string.format("The client could not capture: %s", tostring(result.reason)))
 	end
 
-	return { contentId = tostring(result.contentId), device = Emulation.deviceId() }
+	return {
+		contentId = tostring(result.contentId),
+		region = result.region,
+		device = Emulation.deviceId(),
+		billboards = if typeof(result.billboards) == "number" and result.billboards > 0 then result.billboards else nil,
+		-- A redraw that failed is said, so a missing billboard is not read as absent.
+		billboardError = if typeof(result.billboardError) == "string" then result.billboardError else nil,
+	}
 end
 
 --[[
@@ -722,99 +831,7 @@ local REGION_PADDING = 0.08
 	the screen box around its bounding box's eight corners. A subject partly
 	behind the camera has no honest box, so that is refused with the fix.
 ]]
-local function boundsOf(target: Instance): (Vector2, Vector2)
-	if target:IsA("GuiObject") then
-		local inset = game:GetService("GuiService"):GetGuiInset()
-		return target.AbsolutePosition + inset, target.AbsolutePosition + target.AbsoluteSize + inset
-	end
-
-	local cframe: CFrame, size: Vector3
-	if target:IsA("BasePart") then
-		cframe, size = target.CFrame, target.Size
-	elseif target:IsA("Model") then
-		cframe, size = target:GetBoundingBox()
-	else
-		local low, high = Vector3.one * math.huge, -Vector3.one * math.huge
-		local counted = 0
-		for _, descendant in target:GetDescendants() do
-			if descendant:IsA("BasePart") then
-				local half = descendant.Size / 2
-				for _, corner in { Vector3.new(-1, -1, -1), Vector3.new(1, 1, 1), Vector3.new(-1, 1, -1), Vector3.new(1, -1, 1) } do
-					local point = descendant.CFrame:PointToWorldSpace(half * corner)
-					low, high = low:Min(point), high:Max(point)
-				end
-				counted += 1
-				if counted >= 2000 then
-					break
-				end
-			end
-		end
-		if counted == 0 then
-			Dispatch.fail(
-				"NOT_VISUAL",
-				string.format("%s has no GUI or parts to zoom to.", target:GetFullName()),
-				"Zoom to a GuiObject, a BasePart, a Model, or a folder containing parts."
-			)
-		end
-		cframe, size = CFrame.new((low + high) / 2), high - low
-	end
-
-	local camera = workspace.CurrentCamera
-	local low, high = Vector2.one * math.huge, -Vector2.one * math.huge
-	for _, sx in { -1, 1 } do
-		for _, sy in { -1, 1 } do
-			for _, sz in { -1, 1 } do
-				local point, _ = camera:WorldToViewportPoint(cframe:PointToWorldSpace(size / 2 * Vector3.new(sx, sy, sz)))
-				if point.Z <= 0 then
-					Dispatch.fail(
-						"REGION_OFFSCREEN",
-						string.format("%s is partly behind the camera.", target:GetFullName()),
-						"Aim the camera at it first with `viewport op=\"focus\"`, then take the screenshot."
-					)
-				end
-				local flat = Vector2.new(point.X, point.Y)
-				low, high = low:Min(flat), high:Max(flat)
-			end
-		end
-	end
-	return low, high
-end
-
---[[
-	The part of the capture to keep, in capture pixels.
-
-	`path` zooms to an instance; `rect` is "x, y, width, height" in the pixels of
-	the full-resolution capture, which every screenshot caption states. A path
-	is resolved before the capture, so a bad one fails without taking it.
-]]
-local function regionFor(params: { [string]: any }): Region?
-	if typeof(params.rect) == "string" and params.rect ~= "" then
-		local numbers = {}
-		for token in string.gmatch(params.rect, "-?[%d%.]+") do
-			table.insert(numbers, tonumber(token))
-		end
-		if #numbers ~= 4 or numbers[3] <= 0 or numbers[4] <= 0 then
-			Dispatch.fail("BAD_PARAMS", 'rect must be "x, y, width, height", e.g. "400, 200, 320, 180".')
-		end
-		return { x = numbers[1], y = numbers[2], width = numbers[3], height = numbers[4] }
-	end
-
-	if typeof(params.path) ~= "string" or params.path == "" then
-		return nil
-	end
-	local target = Paths.resolve(params.path)
-	local low, high = boundsOf(target)
-	local extent = high - low
-	local pad = Vector2.new(math.max(8, extent.X * REGION_PADDING), math.max(8, extent.Y * REGION_PADDING))
-	low, high = low - pad, high + pad
-	return {
-		x = low.X,
-		y = low.Y,
-		width = high.X - low.X,
-		height = high.Y - low.Y,
-		viewportWidth = workspace.CurrentCamera.ViewportSize.X,
-	}
-end
+local regionFor = require(script.Parent.Parent.ScreenRegion).of
 
 function Capture.screenshot(params: { [string]: any }): { [string]: any }
 	--[[
@@ -854,7 +871,7 @@ function Capture.decode(params: { [string]: any }): { [string]: any }
 	local width = math.clamp(tonumber(params.width) or DEFAULT_WIDTH, MIN_WIDTH, MAX_WIDTH)
 	local context = if typeof(params.context) == "string" then params.context else "playtest client"
 	-- Only `rect` here: a path would have to be resolved in the client's view.
-	local region = if typeof(params.rect) == "string" then regionFor({ rect = params.rect }) else nil
+	local region = if typeof(params.rect) == "string" then regionFor({ rect = params.rect }) else params.region
 	return encode(contentId :: string, width, context, region)
 end
 

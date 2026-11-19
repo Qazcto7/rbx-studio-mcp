@@ -32,23 +32,16 @@ assert(call({ timeoutSeconds = 9999 }).attributes.Timeout == 300, "timeout is ca
 assert(string.find(plain.source, 'GetAttribute("Settle")', 1, true), "the relay reads Settle")
 assert(string.find(plain.source, 'GetAttribute("Timeout")', 1, true), "the relay reads Timeout")
 
--- The prepare step copies the four modules and wraps the user's code.
+-- The prepare step attaches the shared client runtime and wraps the user's code.
 local relay = { children = {} }
 plain.prepare(relay)
+assert(#attached == 1 and attached[1].relay == relay and attached[1].player == plain.player,
+	"ClientRelay.attachRuntime is called for the relay and player")
 local chunk
 for _, child in relay.children do
 	if child.ClassName == "ModuleScript" then chunk = child end
 end
 assert(chunk ~= nil, "a Chunk module is created")
 assert(chunk.Source == "return function(...) return 1\nend", "the source is wrapped as a function")
-assert(#relay.children == 6, "five cloned modules plus the chunk")
--- By name: ExecRuntime requires LogBuffer, and a relay without it failed on the
--- client with "Requested module experienced an error while loading" (upstream 0.8.3).
-local cloned = {}
-for _, child in relay.children do
-	if child.label then cloned[child.label] = true end
-end
-for _, name in { "ExecRuntime", "LogBuffer", "Serialize", "Paths", "Dispatch" } do
-	assert(cloned[name], name .. " is cloned onto the relay")
-end
+assert(#relay.children == 1, "Chunk is attached onto the relay")
 print("exec client: settle, clamping and relay setup pass")

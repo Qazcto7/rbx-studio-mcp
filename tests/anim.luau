@@ -66,7 +66,8 @@ for _, kid in call.relay:GetChildren() do
 	table.insert(clonedNames, kid.Name or kid.ClassName)
 end
 table.sort(clonedNames)
-assert(#clonedNames == 2, "Paths and Dispatch, nothing else, are cloned onto the relay")
+assert(#clonedNames == 3, "Paths, Dispatch and Handles are cloned onto the relay")
+assert(clonedNames[1] == "Dispatch" and clonedNames[2] == "Handles" and clonedNames[3] == "Paths")
 assert(played.played == true and played.animationId == "session-hash" and played.length == 1)
 
 -- A rig path, when given, becomes the Rig attribute verbatim.
@@ -101,7 +102,7 @@ local stopCloned = 0
 for _ in call.relay:GetChildren() do
 	stopCloned += 1
 end
-assert(stopCloned == 2, "Paths and Dispatch go with the stop relay too")
+assert(stopCloned == 3, "Paths, Dispatch and Handles go with the stop relay too")
 assert(stoppedReply.stopped == 2)
 nextRelayAnswer = { ok = true }
 assert(Anim.stopPlay({}).stopped == 0, "an answer without a count means none stopped")

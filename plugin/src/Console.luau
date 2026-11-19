@@ -22,9 +22,9 @@ local TweenService = game:GetService("TweenService")
 
 local Format = require(script.Parent.Format)
 local Prompt = require(script.Parent.Prompt)
-local ThemePicker = require(script.Parent.ThemePicker)
-local Themes = require(script.Parent.Themes)
-local Visuals = require(script.Parent.Visuals)
+local Palette = require(script.Parent.Palette)
+local Icons = require(script.Parent.Icons)
+local Backdrop = require(script.Parent.Backdrop)
 
 local Console = {}
 
@@ -75,7 +75,27 @@ local MAX_RECORDS = 300
 
 -- The status bar's height. Named because three things now measure against it:
 -- the bar itself, the prompt row sitting on top of it, and the log above both.
-local FOOTER_HEIGHT = 22
+local FOOTER_HEIGHT = 24
+local HEADER_HEIGHT = 38
+
+--[[
+	Header controls, Threadline sizes.
+
+	The three words that used to sit in the header cost 244px between them, more
+	than a third of a docked panel, and said less than a glyph with its name on
+	hover. Icons plus the theme swatches now fit in 196px, and the swatches give
+	way first when the dock gets narrow.
+]]
+local ICON_BUTTON = 26
+local BUTTONS_NARROW = 2 * ICON_BUTTON + 4
+-- The theme dots, one per theme, left of the icons when there is room.
+local SWATCH = 9
+local SWATCH_GAP = 6
+local SWATCH_COUNT = #Palette.list()
+local SWATCHES_WIDTH = SWATCH_COUNT * SWATCH + (SWATCH_COUNT - 1) * SWATCH_GAP + 4
+local BUTTONS_WIDE = BUTTONS_NARROW + 10 + SWATCHES_WIDTH
+-- Below this width the swatches hide and the meta line goes with them.
+local NARROW_HEADER = 520
 
 --[[
 	The active preset's colours, rebound rather than re-read.
@@ -90,7 +110,7 @@ local FOOTER_HEIGHT = 22
 	one. Instances built in `mount` do exactly that, which is why `applyTheme`
 	has to walk them by hand.
 ]]
-local PALETTE: Themes.Palette = Themes.palette()
+local PALETTE: Palette.Palette = Palette.get()
 
 --[[
 	An optional listener on everything this console is told.
@@ -189,11 +209,57 @@ local DETAIL_WRAP = 74
 	Holding the parts rather than the finished string is what lets a theme
 	switch repaint history: see `renderRecord`.
 ]]
+export type Child = { message: string, detail: string? }
+
 type Record = {
+	-- Which collector this row is: "agent", "burst" or "connect".
+	groupKind: string?,
+	-- An agent run in progress: its steps are being added under this row.
+	live: boolean?,
+	-- The run just finished: show the steps, then fold them.
+	ended: boolean?,
+	-- os.clock() of the last line merged into this record; see `Console.log`.
+	at: number?,
+	-- Set once lines have been merged in, so the rebuilt row does not replay
+	-- its arrival animation for the whole block.
+	grown: boolean?,
+	-- Recolours the built row for the live palette, leaving its animations be.
+	repaint: (() -> ())?,
 	level: Level,
 	message: string,
 	detail: string?,
 	stamp: string,
+	-- Memo of `renderRecord`, valid only while `renderedWith` is the live
+	-- palette. Records never change after they are logged, so the palette is
+	-- the one thing that can make this stale.
+	rendered: { string }?,
+	renderedWith: Palette.Palette?,
+	-- Its row in the log, while it has one. Rows are built when a record is
+	-- first painted and destroyed when it is evicted, so an append costs one
+	-- instance rather than a relayout of the whole log.
+	widget: Frame?,
+	-- Monotonic, never reused: the row's LayoutOrder, so a row built late (after
+	-- a filter change) still lands where it belongs.
+	order: number,
+	--[[
+		Threadline: what a row is to the turn around it.
+
+		`turn` marks a line typed into the prompt -- the head of a thread.
+		`threaded` marks everything logged while that turn was open, which hangs
+		off the head under a thread line instead of carrying its own timestamp.
+		`ms` is a tool call's duration, kept as a number so the row can draw its
+		latency bar; prose and notices have none.
+	]]
+	turn: boolean?,
+	threaded: boolean?,
+	ms: number?,
+	-- The work kind of the call this row reports (read, write, run, debug):
+	-- the colour of its station on the line.
+	kind: string?,
+	-- Sub-items drawn under the row on a straight connector; see `logGroup`.
+	children: { Child }?,
+	-- The last row of a turn that has closed: its line ends in a cap.
+	capped: boolean?,
 }
 
 --[[
@@ -212,6 +278,12 @@ export type Client = {
 }
 
 type State = {
+	-- Bumped per theme switch, so a slower recolour pass yields to a newer one.
+	repaintGeneration: number?,
+	-- The work kind of the last call that went out, for the line map's stations.
+	lastKind: string?,
+	-- The status dot's breathing while connected.
+	statusPulse: Tween?,
 	records: { Record },
 	-- The last status reported, replayed after a theme switch. Without it the
 	-- header has no way to know what colour it should be wearing.
@@ -229,13 +301,34 @@ type State = {
 		means by a log line.
 	]]
 	entries: number,
-	label: TextLabel?,
+	-- Holds one row per visible record. See `paint`.
+	list: Frame?,
 	scroller: ScrollingFrame?,
+	-- Set when every row must be rebuilt: a theme or filter change, a clear.
+	rebuild: boolean,
+	nextOrder: number,
+	-- Rows that arrived while the user was reading history, and the pill that
+	-- offers the way back to the tail.
+	unread: number,
+	jumpPill: TextButton?,
 	statusDot: TextLabel?,
 	statusText: TextLabel?,
 	metaText: TextLabel?,
 	countersText: TextLabel?,
 	clientsChip: TextButton?,
+	-- The background gradient and the theme dots, repainted on a theme switch.
+	fieldGradient: UIGradient?,
+	swatchRow: Frame?,
+	swatches: { [string]: GuiButton },
+	-- True while the pointer has a log row opened up; pauses tail-following.
+	hoverHold: boolean?,
+	-- The group collecting rows right now: an agent run, a burst of calls, or
+	-- a reconnect sequence. See `Console.log`.
+	agentGroup: Record?,
+	-- An agent run is under way (between "is starting" and "Done"), and the
+	-- name it runs under. Steps after its prose open a fresh group below it.
+	agentRunning: boolean?,
+	agentLabel: string?,
 	pinned: boolean,
 	calls: number,
 	errors: number,
@@ -310,7 +403,9 @@ type State = {
 		that arithmetic is how the log ends up overlapping the band.
 	]]
 	relayout: (() -> ())?,
-	visualsButton: TextButton?,
+	-- Whether rows logged now belong to the turn the last prompt opened.
+	inTurn: boolean,
+	headerButtons: Frame?,
 }
 
 local state: State = {
@@ -319,13 +414,20 @@ local state: State = {
 	status = "disconnected",
 	statusMeta = "",
 	entries = 0,
-	label = nil,
+	list = nil,
 	scroller = nil,
+	rebuild = false,
+	nextOrder = 0,
+	unread = 0,
+	jumpPill = nil,
 	statusDot = nil,
 	statusText = nil,
 	metaText = nil,
 	countersText = nil,
 	clientsChip = nil,
+	fieldGradient = nil,
+	swatchRow = nil,
+	swatches = {},
 	pinned = true,
 	calls = 0,
 	errors = 0,
@@ -345,7 +447,8 @@ local state: State = {
 	crtGeneration = 0,
 	filter = nil,
 	relayout = nil,
-	visualsButton = nil,
+	inTurn = false,
+	headerButtons = nil,
 }
 
 -- Declared ahead of its definition: `setClients` calls it and is written
@@ -478,17 +581,37 @@ local function renderRecord(record: Record): { string }
 	]]
 	local prose = record.level == "reply"
 
-	local function line(text: string): string
-		local escaped = Format.escape(text)
-		if prose then
-			escaped = Format.emphasise(escaped, hex(PALETTE.cyan))
-		end
-		return string.format('<font color="%s">%s</font>', hex(PALETTE[spec.key]), escaped)
+	--[[
+		Threadline colours. A turn's head reads in the text colour behind a violet
+		caret, because it is the user's own words; a finished tool call is a cyan
+		mark beside a plain name, so the eye runs down the marks and reads the
+		names. Everything else keeps its level's colour.
+	]]
+	local sigil = spec.sigil
+	local sigilKey = spec.key
+	local textKey = spec.key
+	if record.turn then
+		sigil, sigilKey, textKey = "\u{203A}", "violet", "text"
+	elseif record.ms ~= nil and record.level == "reply" then
+		sigil, sigilKey, textKey = "\u{25B8}", "cyan", "text"
 	end
 
-	local body = string.format("%s %s", spec.sigil, trimmed)
+	local function line(text: string): string
+		local escaped = Format.escape(text)
+		if prose and record.ms == nil then
+			escaped = Format.emphasise(escaped, hex(PALETTE.cyan))
+		end
+		return string.format('<font color="%s">%s</font>', hex(PALETTE[textKey]), escaped)
+	end
+
+	-- A threaded row gives its timestamp's columns to the thread line, so every
+	-- column to its right stays exactly where an unthreaded row puts it.
+	local stamp = if record.threaded then string.rep(" ", utf8.len(record.stamp) or #record.stamp) else record.stamp
+	local body = string.format("%s %s", sigil, trimmed)
 	local bodyWidth = utf8.len(body) or #body
-	local lines = { span(PALETTE.dim, record.stamp) .. " " .. line(body) }
+	local lines = {
+		span(PALETTE.dim, stamp) .. " " .. span(PALETTE[sigilKey], sigil) .. " " .. line(trimmed),
+	}
 
 	-- In the message's own colour, not the dim of a detail: these lines ARE the
 	-- message, and greying them would read as an explanation of it.
@@ -520,23 +643,612 @@ local function renderRecord(record: Record): { string }
 	return lines
 end
 
-local function paint()
-	state.dirty = false
-	local label = state.label
-	if not label then
-		return
-	end
+--[[
+	The rows a record occupies, coloured for the live palette.
 
-	local lines: { string } = {}
+	Memoised: records never change after they are logged, so the palette is the
+	one thing that can make a render stale.
+]]
+local function renderedLines(record: Record): { string }
+	local rendered = record.rendered
+	if rendered == nil or record.renderedWith ~= PALETTE then
+		rendered = renderRecord(record)
+		record.rendered = rendered
+		record.renderedWith = PALETTE
+	end
+	return rendered :: { string }
+end
+
+local function visible(record: Record): boolean
 	local filter = state.filter
+	return filter == nil or filter[record.level] == true
+end
+
+-- The same text the old single label held. The clear wipe copies it.
+local function allText(): string
+	local lines: { string } = {}
 	for _, record in state.records do
-		if filter == nil or filter[record.level] then
-			for _, line in renderRecord(record) do
+		if visible(record) then
+			for _, line in renderedLines(record) do
 				table.insert(lines, line)
 			end
 		end
 	end
-	label.Text = table.concat(lines, "\n")
+	return table.concat(lines, "\n")
+end
+
+local KIND_LOOK: { [string]: { key: string, urgency: number } } = {
+	read = { key = "cyan", urgency = 0.3 },
+	write = { key = "violet", urgency = 0.7 },
+	run = { key = "green", urgency = 0.9 },
+	debug = { key = "amber", urgency = 0.5 },
+}
+
+--[[
+	The log's columns, in pixels: time, a kind diamond, the message, and a
+	right-hand column for a short detail such as a duration. Laid out by
+	Instances rather than by padding monospaced text, so nothing depends on
+	how wide Studio happens to draw a character.
+]]
+local TIME_WIDTH = 54
+local DOT_SIZE = 5
+local DOT_HOVER = 8
+-- Extra room a hovered row takes above and below, pushing its neighbours away.
+local HOVER_SPACE = 5
+-- Sub-item rows under a grouped row, and how they open and fold.
+local CHILD_HEIGHT = 20
+local GROUP_HOLD = 6
+local GROUP_OPEN = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local GROUP_CLOSE = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
+local FADE_QUICK = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local POP = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local SETTLE = TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local DOT_POP = 10
+-- Rows built in the same frame arrive one after another, this far apart.
+local STAGGER = 0.06
+local FADE = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 0.12)
+local HOVER_IN = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local HOVER_OUT = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TEXT_X = 70
+local RIGHT_WIDTH = 86
+-- Longest detail that rides the right column; anything longer goes beneath.
+local RIGHT_MAX = 14
+local LINE = 18
+
+--[[
+	The end of a turn: a faint hairline under its last row, so one request
+	reads as a block.
+]]
+local function addCap(_row: GuiObject)
+	-- Deliberately draws nothing now: a hairline under a turn's last row read
+	-- as a stray underline. The space above each typed command separates turns.
+end
+
+-- The diamond's colour: what kind of work, or how it went.
+local function dotKey(record: Record): string
+	if record.level == "error" then
+		return "red"
+	elseif record.level == "warn" then
+		return "amber"
+	elseif record.turn then
+		return "violet"
+	elseif record.ms ~= nil then
+		local look = KIND_LOOK[record.kind or ""]
+		return if look then look.key else "cyan"
+	end
+	return (LEVELS[record.level] or LEVELS.info).key
+end
+
+local function textKey(record: Record): string
+	if record.level == "error" then
+		return "red"
+	elseif record.level == "warn" then
+		return "amber"
+	elseif record.level == "dim" then
+		return "dim"
+	end
+	return "text"
+end
+
+local function label(font: Enum.Font, size: number, color: Color3): TextLabel
+	local text = Instance.new("TextLabel")
+	text.BackgroundTransparency = 1
+	text.Font = font
+	text.TextSize = size
+	text.TextColor3 = color
+	text.TextXAlignment = Enum.TextXAlignment.Left
+	text.TextYAlignment = Enum.TextYAlignment.Center
+	return text
+end
+
+local function buildRow(record: Record, list: Frame, animate: boolean?, delay: number?, previous: Record?): Frame
+	--[[
+		A reply arrives one line per row. Lines after the first are the same
+		answer, so they drop the time and the diamond and sit tight under it.
+		A time the row above already showed is not repeated either.
+	]]
+	local prose = record.level == "reply" and record.ms == nil and not record.turn
+	local continues = prose
+		and previous ~= nil
+		and previous.level == "reply"
+		and previous.ms == nil
+		and not previous.turn
+	local sameTime = previous ~= nil and previous.stamp == record.stamp
+
+	--[[
+		How each coloured part of this row is set, kept so a theme switch can
+		recolour the row where it stands. Rebuilding every row instead cut off
+		whatever was animating -- a reply typing itself out, an open group, a
+		live run -- and replayed the live ones from the start.
+	]]
+	local paints: { () -> () } = {}
+	local function paint(instance: GuiObject, property: string, key: string)
+		(instance :: any)[property] = PALETTE[key]
+		table.insert(paints, function()
+			(instance :: any)[property] = PALETTE[key]
+		end)
+	end
+	record.repaint = function()
+		for _, apply in paints do
+			apply()
+		end
+	end
+
+	local row = Instance.new("TextButton")
+	row.Name = "Row"
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.BorderSizePixel = 0
+	paint(row, "BackgroundColor3", "rule")
+	row.BackgroundTransparency = 1
+	row.Size = UDim2.new(1, 0, 0, 0)
+	row.AutomaticSize = Enum.AutomaticSize.Y
+	row.LayoutOrder = record.order
+
+	-- Hover wash: bright at the left, gone by the right edge.
+	local wash = Instance.new("UIGradient")
+	wash.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.8),
+		NumberSequenceKeypoint.new(0.85, 1),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	wash.Parent = row
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, if record.turn then 12 elseif continues then 0 else 3)
+	padding.PaddingBottom = UDim.new(0, 3)
+	padding.PaddingLeft = UDim.new(0, 4)
+	padding.PaddingRight = UDim.new(0, 4)
+	padding.Parent = row
+
+	local time = label(Enum.Font.Code, 11, PALETTE.dim)
+	time.Name = "Time"
+	time.Text = if sameTime or continues then "" else record.stamp
+	time.Size = UDim2.fromOffset(TIME_WIDTH, LINE)
+	time.Parent = row
+	paint(time, "TextColor3", "dim")
+
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.BorderSizePixel = 0
+	dot.Rotation = 45
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromOffset(TIME_WIDTH + 6, LINE / 2)
+	dot.Size = UDim2.fromOffset(DOT_SIZE, DOT_SIZE)
+	paint(dot, "BackgroundColor3", dotKey(record))
+	dot.Visible = not continues
+	dot.Parent = row
+
+	-- What sits in the right column: a short detail, else the duration.
+	local detail = record.detail
+	local right: string? = nil
+	local below: string? = nil
+	if detail ~= nil and detail ~= "" then
+		local width = utf8.len(detail) or #detail
+		if width <= RIGHT_MAX and not string.find(detail, "\n", 1, true) then
+			right = detail
+		else
+			below = detail
+		end
+	end
+	if right == nil and record.ms ~= nil then
+		right = Console.durationText(record.ms)
+	end
+
+	local content = Instance.new("Frame")
+	content.Name = "Content"
+	content.BackgroundTransparency = 1
+	content.Position = UDim2.fromOffset(TEXT_X, 0)
+	content.Size = UDim2.new(1, -(TEXT_X + (if right then RIGHT_WIDTH else 0)), 0, 0)
+	content.AutomaticSize = Enum.AutomaticSize.Y
+	content.Parent = row
+
+	local stack = Instance.new("UIListLayout")
+	stack.SortOrder = Enum.SortOrder.LayoutOrder
+	stack.Padding = UDim.new(0, 1)
+	stack.Parent = content
+
+	local message = record.message
+	-- Markdown list items read as bullets, not as a stray dash.
+	if prose then
+		local lines = string.split(message, "\n")
+		for index, text in lines do
+			local item = string.match(text, "^%s*[%-%*]%s+(.*)$")
+			if item ~= nil then
+				lines[index] = "\u{2022}  " .. item
+			end
+		end
+		message = table.concat(lines, "\n")
+	end
+	local escaped = Format.escape(message)
+	local emphasised = record.level == "reply" and record.ms == nil
+	if emphasised then
+		escaped = Format.emphasise(escaped, hex(PALETTE.cyan))
+	end
+	-- What the user typed stands out from what came back.
+	local body = label(if record.turn then Palette.FONT_BOLD else Palette.FONT, 14, PALETTE[textKey(record)])
+	paint(body, "TextColor3", textKey(record))
+	if emphasised then
+		-- The emphasis colour lives inside the RichText, so the text is redone.
+		local plain = Format.escape(message)
+		table.insert(paints, function()
+			body.Text = Format.emphasise(plain, hex(PALETTE.cyan))
+		end)
+	end
+	body.Name = "Body"
+	body.RichText = true
+	body.TextWrapped = true
+	body.TextYAlignment = Enum.TextYAlignment.Top
+	body.LineHeight = 1.1
+	body.Size = UDim2.new(1, 0, 0, LINE)
+	body.AutomaticSize = Enum.AutomaticSize.Y
+	body.Text = escaped
+	body.LayoutOrder = 1
+	body.Parent = content
+
+	if below then
+		local note = label(Palette.FONT, 12, PALETTE.dim)
+		note.Name = "Detail"
+		note.TextWrapped = true
+		note.TextYAlignment = Enum.TextYAlignment.Top
+		note.Size = UDim2.new(1, 0, 0, 14)
+		note.AutomaticSize = Enum.AutomaticSize.Y
+		note.Text = below
+		note.LayoutOrder = 2
+		note.Parent = content
+		paint(note, "TextColor3", "dim")
+	end
+
+	if right then
+		local side = label(Enum.Font.Code, 11, if record.level == "error" then PALETTE.red else PALETTE.dim)
+		side.Name = "Right"
+		side.TextXAlignment = Enum.TextXAlignment.Right
+		side.TextTruncate = Enum.TextTruncate.AtEnd
+		side.AnchorPoint = Vector2.new(1, 0)
+		side.Position = UDim2.new(1, 0, 0, 0)
+		side.Size = UDim2.fromOffset(RIGHT_WIDTH - 6, LINE)
+		side.Text = right
+		side.Parent = row
+		paint(side, "TextColor3", if record.level == "error" then "red" else "dim")
+	end
+
+	if record.capped then
+		addCap(row)
+	end
+
+	--[[
+		Sub-items on a straight connector: a vertical spine from under the
+		message, a square elbow into each item. Open when the row arrives live,
+		folded a few seconds later, and opened again while the row is hovered.
+	]]
+	local children = record.children
+	local setOpen: ((boolean) -> ())? = nil
+	local holdOpen = false
+	if children ~= nil and #children > 0 then
+		local count = #children
+		local tree = Instance.new("Frame")
+		tree.Name = "Children"
+		tree.BackgroundTransparency = 1
+		tree.ClipsDescendants = true
+		tree.Size = UDim2.new(1, 0, 0, 0)
+		tree.LayoutOrder = 3
+		tree.Parent = content
+
+		local spine = Instance.new("Frame")
+		spine.Name = "Spine"
+		spine.BorderSizePixel = 0
+		paint(spine, "BackgroundColor3", "rule")
+		spine.BackgroundTransparency = 0.45
+		spine.Position = UDim2.fromOffset(4, 0)
+		spine.Size = UDim2.fromOffset(1, (count - 1) * CHILD_HEIGHT + CHILD_HEIGHT / 2 + 1)
+		spine.Parent = tree
+
+		local labels: { TextLabel } = {}
+		local newest: { TextLabel } = {}
+		for index, child in children do
+			local top = (index - 1) * CHILD_HEIGHT
+			local elbow = Instance.new("Frame")
+			elbow.Name = "Elbow"
+			elbow.BorderSizePixel = 0
+			paint(elbow, "BackgroundColor3", "rule")
+			elbow.BackgroundTransparency = 0.45
+			elbow.Position = UDim2.fromOffset(4, top + CHILD_HEIGHT / 2)
+			elbow.Size = UDim2.fromOffset(9, 1)
+			elbow.Parent = tree
+
+			local name = label(Palette.FONT, 13, PALETTE.text)
+			name.Name = "Item"
+			name.TextTruncate = Enum.TextTruncate.AtEnd
+			name.Position = UDim2.fromOffset(18, top)
+			name.Size = UDim2.new(1, -(18 + (if child.detail then 110 else 0)), 0, CHILD_HEIGHT)
+			name.Text = child.message
+			name.Parent = tree
+			paint(name, "TextColor3", "text")
+			table.insert(labels, name)
+			if index == count then
+				table.insert(newest, name)
+			end
+
+			if child.detail then
+				local side = label(Enum.Font.Code, 11, PALETTE.dim)
+				side.Name = "ItemDetail"
+				side.TextXAlignment = Enum.TextXAlignment.Right
+				side.TextTruncate = Enum.TextTruncate.AtEnd
+				side.AnchorPoint = Vector2.new(1, 0)
+				side.Position = UDim2.new(1, -2, 0, top)
+				side.Size = UDim2.fromOffset(106, CHILD_HEIGHT)
+				side.Text = child.detail
+				side.Parent = tree
+				paint(side, "TextColor3", "dim")
+				table.insert(labels, side)
+				if index == count then
+					table.insert(newest, side)
+				end
+			end
+		end
+
+		-- Shown in the right column while folded, so a folded row says it has more.
+		local more: TextLabel? = nil
+		if right == nil then
+			local hint = label(Enum.Font.Code, 11, PALETTE.dim)
+			hint.Name = "More"
+			hint.TextXAlignment = Enum.TextXAlignment.Right
+			hint.AnchorPoint = Vector2.new(1, 0)
+			hint.Position = UDim2.new(1, 0, 0, 0)
+			hint.Size = UDim2.fromOffset(RIGHT_WIDTH - 6, LINE)
+			hint.Text = string.format("+%d", count)
+			hint.Parent = row
+			paint(hint, "TextColor3", "dim")
+			more = hint
+		end
+
+		local open = false
+		setOpen = function(wanted: boolean)
+			if wanted == open then
+				return
+			end
+			open = wanted
+			TweenService:Create(tree, if wanted then GROUP_OPEN else GROUP_CLOSE, {
+				Size = UDim2.new(1, 0, 0, if wanted then count * CHILD_HEIGHT + 2 else 0),
+			}):Play()
+			if more then
+				TweenService:Create(more, FADE_QUICK, { TextTransparency = if wanted then 1 else 0 }):Play()
+			end
+			if wanted then
+				-- Each item writes itself in, one after the other.
+				for index, item in labels do
+					local length = utf8.len(item.ContentText) or #item.ContentText
+					item.MaxVisibleGraphemes = 0
+					local typing = TweenService:Create(
+						item,
+						TweenInfo.new(math.clamp(length * 0.012, 0.15, 0.25), Enum.EasingStyle.Linear),
+						{ MaxVisibleGraphemes = length }
+					)
+					typing.Completed:Connect(function()
+						item.MaxVisibleGraphemes = -1
+					end)
+					task.delay(0.05 * index, function()
+						typing:Play()
+					end)
+				end
+			end
+		end
+
+		local function showNow()
+			open = true
+			tree.Size = UDim2.new(1, 0, 0, count * CHILD_HEIGHT + 2)
+			if more then
+				more.TextTransparency = 1
+			end
+		end
+		if record.live then
+			-- A run in progress stays open; only the step that just landed types in.
+			showNow()
+			holdOpen = true
+			for _, item in newest do
+				local length = utf8.len(item.ContentText) or #item.ContentText
+				item.MaxVisibleGraphemes = 0
+				local typing = TweenService:Create(
+					item,
+					TweenInfo.new(math.clamp(length * 0.012, 0.15, 0.25), Enum.EasingStyle.Linear),
+					{ MaxVisibleGraphemes = length }
+				)
+				typing.Completed:Connect(function()
+					item.MaxVisibleGraphemes = -1
+				end)
+				typing:Play()
+			end
+		elseif record.ended then
+			-- Just finished: leave the steps up a moment, then fold them away.
+			record.ended = nil
+			showNow()
+			holdOpen = true
+			task.delay(GROUP_HOLD, function()
+				holdOpen = false
+				if setOpen and not state.hoverHold then
+					setOpen(false)
+				end
+			end)
+		elseif animate then
+			holdOpen = true
+			task.delay((delay or 0) + 0.4, function()
+				if setOpen then
+					setOpen(true)
+				end
+			end)
+			task.delay((delay or 0) + GROUP_HOLD, function()
+				holdOpen = false
+				if setOpen and not state.hoverHold then
+					setOpen(false)
+				end
+			end)
+		end
+	end
+
+	--[[
+		Arrival: the diamond pops in with a small overshoot, then the message
+		types itself out left to right and the side text fades up behind it.
+		Only for rows that arrive live; a rebuild or a restored session would
+		otherwise replay a hundred of these at once.
+	]]
+	if animate and not record.grown then
+		local wait = delay or 0
+		-- Two beats: swell past full size, then settle back with a small bounce.
+		dot.Size = UDim2.fromOffset(0, 0)
+		local swell = TweenService:Create(dot, POP, { Size = UDim2.fromOffset(DOT_POP, DOT_POP) })
+		swell.Completed:Connect(function()
+			TweenService:Create(dot, SETTLE, { Size = UDim2.fromOffset(DOT_SIZE, DOT_SIZE) }):Play()
+		end)
+		task.delay(wait, function()
+			swell:Play()
+		end)
+		--[[
+			What the user typed is not typed out again: they just wrote it, and
+			watching it spelled back letter by letter read as the line being
+			sent twice. It lands whole; only what comes back types itself in.
+		]]
+		if not record.turn then
+			local graphemes = utf8.len(body.ContentText) or #body.ContentText
+			body.MaxVisibleGraphemes = 0
+			local typing = TweenService:Create(
+				body,
+				TweenInfo.new(math.clamp(graphemes * 0.012, 0.2, 0.3), Enum.EasingStyle.Linear),
+				{ MaxVisibleGraphemes = graphemes }
+			)
+			task.delay(wait + 0.1, function()
+				typing:Play()
+			end)
+			typing.Completed:Connect(function()
+				body.MaxVisibleGraphemes = -1
+			end)
+		end
+		for _, child in row:GetDescendants() do
+			if child:IsA("TextLabel") and child ~= body then
+				local label = child :: TextLabel
+				label.TextTransparency = 1
+				TweenService:Create(label, FADE, { TextTransparency = 0 }):Play()
+			end
+		end
+	end
+
+	local restTop = padding.PaddingTop.Offset
+	local function hover(on: boolean)
+		-- While a row is opened up, the log must not chase the tail: the
+		-- extra height would scroll it out from under the pointer.
+		state.hoverHold = on
+		row.BackgroundTransparency = if on then 0 else 1
+		if setOpen then
+			if on then
+				setOpen(true)
+			elseif not holdOpen then
+				setOpen(false)
+			end
+		end
+		local info = if on then HOVER_IN else HOVER_OUT
+		TweenService:Create(padding, info, {
+			PaddingTop = UDim.new(0, if on then restTop + HOVER_SPACE else restTop),
+			PaddingBottom = UDim.new(0, if on then 3 + HOVER_SPACE else 3),
+		}):Play()
+		TweenService:Create(dot, info, {
+			Size = UDim2.fromOffset(if on then DOT_HOVER else DOT_SIZE, if on then DOT_HOVER else DOT_SIZE),
+		}):Play()
+	end
+	row.MouseEnter:Connect(function()
+		-- Roblox sends hover to everything under the pointer, covered or not;
+		-- a row under the open command menu must stay still.
+		if Prompt.isMenuOpen() then
+			return
+		end
+		hover(true)
+	end)
+	row.MouseLeave:Connect(function()
+		hover(false)
+	end)
+
+	row.Parent = list
+	return row
+end
+
+local function updateJumpPill()
+	local pill = state.jumpPill
+	if pill == nil then
+		return
+	end
+	pill.Visible = not state.pinned
+	pill.Text = if state.unread > 0
+		then string.format("%d new \u{2193}", state.unread)
+		else "latest \u{2193}"
+end
+
+--[[
+	Brings the log up to date with the records, building only what is missing.
+
+	One TextButton per record instead of one label holding all of them: the label
+	re-laid-out every line of RichText on each append, a cost that grows with the
+	log, where a row is a constant. A theme switch, a filter change and a clear
+	are the only things that touch existing rows, and they say so with
+	`state.rebuild`.
+]]
+local function paint()
+	state.dirty = false
+	local list = state.list
+	if not list then
+		return
+	end
+
+	local rebuilt = state.rebuild
+	if state.rebuild then
+		state.rebuild = false
+		for _, child in list:GetChildren() do
+			if child:IsA("GuiObject") then
+				child:Destroy()
+			end
+		end
+		for _, record in state.records do
+			record.widget = nil
+		end
+	end
+
+	-- Animate only a live trickle: a rebuild, a restore or a burst just appears.
+	local pending = 0
+	for _, record in state.records do
+		if record.widget == nil and visible(record) then
+			pending += 1
+		end
+	end
+	local animate = not rebuilt and pending <= 4
+
+	local built = 0
+	local previous: Record? = nil
+	for _, record in state.records do
+		if visible(record) then
+			if record.widget == nil then
+				record.widget = buildRow(record, list, animate, built * STAGGER, previous)
+				built += 1
+			end
+			previous = record
+		end
+	end
 
 	-- Only follow the tail when the user has not scrolled up to read history.
 	local scroller = state.scroller
@@ -546,6 +1258,9 @@ local function paint()
 				scroller.CanvasPosition = Vector2.new(0, math.max(0, scroller.AbsoluteCanvasSize.Y))
 			end
 		end)
+	elseif built > 0 then
+		state.unread += built
+		updateJumpPill()
 	end
 end
 
@@ -640,13 +1355,16 @@ local function refreshCounters()
 		counters.Text = "idle"
 		return
 	end
+	-- RichText so the error count can wear red when there is one, the one
+	-- number on this line that asks for attention.
+	counters.RichText = true
+	local errors = string.format("%d error%s", state.errors, if state.errors == 1 then "" else "s")
 	counters.Text = string.format(
-		"%d call%s  %d error%s  typical %s",
+		"%d call%s \u{00B7} %s \u{00B7} typical %s",
 		state.calls,
 		if state.calls == 1 then "" else "s",
-		state.errors,
-		if state.errors == 1 then "" else "s",
-		typicalText()
+		if state.errors > 0 then span(PALETTE.red, errors) else Format.escape(errors),
+		Format.escape(typicalText())
 	)
 end
 
@@ -655,8 +1373,224 @@ end
 	latencies stack into a readable column instead of trailing each message at a
 	ragged offset.
 ]]
-function Console.log(level: Level, message: string, detail: string?)
+--[[
+	Ends the group being collected: its row stops taking rows, shows them a
+	moment longer, then folds them away.
+]]
+local function trimLeft(text: string): string
+	return (string.gsub(text, "^%s+", ""))
+end
+
+-- Gap after which a call no longer joins the burst before it.
+local BURST_GAP = 4
+
+local function burstTitle(count: number): string
+	return string.format("Agent activity \u{00B7} %d calls", count)
+end
+
+-- Lines that belong to a reconnect sequence.
+local function connectionLine(message: string): boolean
+	return string.sub(message, 1, 19) == "reconnect requested"
+		or string.sub(message, 1, 12) == "disconnected"
+		or string.sub(message, 1, 13) == "connecting to"
+		or string.sub(message, 1, 12) == "connected to"
+end
+
+local endGroup: () -> ()
+
+-- A burst closes itself once calls stop arriving.
+local function scheduleBurstEnd(group: Record)
+	local stamp = group.at
+	task.delay(BURST_GAP, function()
+		if state.agentGroup == group and group.at == stamp then
+			endGroup()
+		end
+	end)
+end
+
+function endGroup()
+	local group = state.agentGroup
+	if group == nil then
+		return
+	end
+	state.agentGroup = nil
+	group.live = nil
+	group.ended = true
+	if group.groupKind == "agent" and group.children ~= nil then
+		local label = string.match(group.message, "^(.-) is ") or state.agentLabel or "Agent"
+		local count = #group.children
+		group.message = string.format("%s \u{00B7} %d step%s", label, count, if count == 1 then "" else "s")
+	end
+	group.rendered = nil
+	-- Rebuilt, not arrived: without this a typed line closed by "... is
+	-- starting" popped in and typed itself out a second time.
+	group.grown = true
+	if group.widget ~= nil then
+		group.widget:Destroy()
+		group.widget = nil
+	end
+	redraw()
+end
+
+function Console.log(level: Level, message: string, detail: string?, ms: number?, children: { Child }?)
+	--[[
+		A line typed into the prompt opens a turn; it is echoed as a `call` whose
+		detail says it was "you". Everything after it hangs off that head until
+		the turn is closed -- see `Console.endTurn`.
+	]]
+	local relayed = detail
+	local turn = level == "call" and (detail == "you" or detail == "you (hidden)")
+	--[[
+		Only a line typed while nothing is running opens a thread. One typed
+		while a panel agent works joins that agent's thread instead of stealing
+		the rest of its run. The playtest client mirror never opens one: the
+		events that close a turn are not relayed to it, so a thread opened there
+		would never end.
+	]]
+	local opens = turn and not mirroring and not Prompt.isBusy()
+	if turn then
+		-- "you" is what the caret already says. A masked line keeps its warning.
+		detail = if detail == "you (hidden)" then "hidden" else nil
+	end
+	if opens then
+		state.inTurn = true
+	end
+
+	--[[
+		While an agent runs, its steps -- its own tool calls and the Studio calls
+		they make -- hang under the run's row instead of filling the log. The
+		answer itself, and anything that is not a step, stays a row of its own.
+	]]
+	local group = state.agentGroup
+	local isCall = (level == "reply" or level == "error") and ms ~= nil
+
+	-- The agent wrote something mid-run: the steps so far fold above it, and the
+	-- ones after it start a new group below, where they actually happened.
+	if group ~= nil and group.groupKind == "agent" and level == "reply" and ms == nil and not turn then
+		endGroup()
+		group = nil
+	end
+	if group == nil and state.agentRunning and children == nil and not turn and (level == "call" or isCall) then
+		Console.log("dim", (state.agentLabel or "Agent") .. " is continuing\u{2026}")
+		group = state.agentGroup
+	end
+
+	if group ~= nil and children == nil and not turn then
+		local kind = group.groupKind
+		local starting = string.find(message, " is starting", 1, true) ~= nil
+			or string.find(message, " is continuing", 1, true) ~= nil
+		local step = if kind == "agent"
+			then level == "call" or isCall
+			elseif kind == "burst" then isCall and os.clock() - (group.at or 0) < BURST_GAP
+			elseif kind == "command" then not starting
+			else connectionLine(message)
+		if starting and kind == "command" then
+			-- A prompt for an agent, not a command: the run gets its own row.
+			endGroup()
+		end
+		if not step and kind == "burst" then
+			-- Anything else between calls ends the burst; this row stands alone.
+			endGroup()
+		end
+		if step then
+			local steps = group.children or {}
+			table.insert(steps, {
+				message = Format.flatten(if level == "error" then "\u{2715} " .. message else message),
+				detail = if detail ~= nil
+					then Format.flatten(detail)
+					elseif ms ~= nil then Console.durationText(ms)
+					else nil,
+			})
+			group.children = steps
+			group.grown = true
+			group.rendered = nil
+			group.at = os.clock()
+			if kind == "burst" then
+				group.message = burstTitle(#steps)
+				scheduleBurstEnd(group)
+			elseif kind == "connect" and string.sub(message, 1, 12) == "connected to" then
+				-- The sequence resolves: the row says where it landed.
+				group.message = Format.flatten(message)
+				group.level = "ok"
+				group.detail = nil
+				endGroup()
+			end
+			if group.widget ~= nil then
+				group.widget:Destroy()
+				group.widget = nil
+			end
+			redraw()
+			notify("log", { level, message, relayed, ms })
+			return
+		end
+	end
+
+	--[[
+		A second call close behind the first, outside any agent run, turns the
+		pair into one live "Agent activity" row that keeps counting.
+	]]
+	local previousRecord = state.records[#state.records]
+	if state.agentGroup == nil and isCall and children == nil and not turn and not state.inTurn
+		and previousRecord ~= nil and previousRecord.ms ~= nil and previousRecord.children == nil
+		and (previousRecord.level == "reply" or previousRecord.level == "error")
+		and os.clock() - (previousRecord.at or 0) < BURST_GAP
+	then
+		local first: Child = {
+			message = (if previousRecord.level == "error" then "\u{2715} " else "") .. previousRecord.message,
+			detail = previousRecord.detail or Console.durationText(previousRecord.ms :: number),
+		}
+		local second: Child = {
+			message = Format.flatten(if level == "error" then "\u{2715} " .. message else message),
+			detail = if detail ~= nil then Format.flatten(detail) else Console.durationText(ms :: number),
+		}
+		previousRecord.children = { first, second }
+		previousRecord.message = burstTitle(2)
+		previousRecord.level = "call"
+		previousRecord.detail = nil
+		previousRecord.ms = nil
+		previousRecord.groupKind = "burst"
+		previousRecord.live = true
+		previousRecord.grown = true
+		previousRecord.rendered = nil
+		previousRecord.at = os.clock()
+		if previousRecord.widget ~= nil then
+			previousRecord.widget:Destroy()
+			previousRecord.widget = nil
+		end
+		state.agentGroup = previousRecord
+		scheduleBurstEnd(previousRecord)
+		redraw()
+		notify("log", { level, message, relayed, ms })
+		return
+	end
+
+	--[[
+		An agent's reply arrives one line at a time. Lines that follow straight
+		on from a reply are the same answer, so they join that record and the
+		whole answer is one row: one hover, one block, one time.
+	]]
+	local last = state.records[#state.records]
+	if level == "reply" and ms == nil and not turn and children == nil
+		and last ~= nil and last.level == "reply" and last.ms == nil and not last.turn
+		and last.children == nil and os.clock() - (last.at or 0) < 3
+	then
+		last.message ..= "\n" .. Format.flatten(message)
+		last.at = os.clock()
+		last.grown = true
+		last.rendered = nil
+		if last.widget ~= nil then
+			last.widget:Destroy()
+			last.widget = nil
+		end
+		redraw()
+		notify("log", { level, message, relayed, ms })
+		return
+	end
+
+	state.nextOrder += 1
 	table.insert(state.records, {
+		at = os.clock(),
+		order = state.nextOrder,
 		level = level,
 		message = Format.flatten(message),
 		detail = if detail ~= nil then Format.flatten(detail) else nil,
@@ -664,13 +1598,73 @@ function Console.log(level: Level, message: string, detail: string?)
 		-- a theme switch re-renders every line, and re-reading the clock there
 		-- would restamp the whole session to the moment the user changed colour.
 		stamp = os.date("%H:%M:%S") :: string,
+		turn = if turn then true else nil,
+		threaded = if state.inTurn and not opens then true else nil,
+		ms = ms,
+		kind = if ms ~= nil then state.lastKind else nil,
+		children = children,
 	})
 	state.entries += 1
+
+	-- "Claude Code is starting..." opens a run that collects the steps after it.
+	local added = state.records[#state.records]
+	if level == "dim" and children == nil
+		and (string.find(message, " is starting", 1, true) or string.find(message, " is continuing", 1, true))
+	then
+		endGroup()
+		added.live = true
+		added.groupKind = "agent"
+		state.agentGroup = added
+		state.agentRunning = true
+		state.agentLabel = string.match(message, "^(.-) is ") or state.agentLabel
+	elseif turn and children == nil then
+		-- A typed command: what it prints hangs under it.
+		endGroup()
+		added.live = true
+		added.groupKind = "command"
+		state.agentGroup = added
+	elseif state.agentGroup == nil and children == nil and connectionLine(message)
+		and string.sub(message, 1, 12) ~= "connected to"
+	then
+		-- The start of a reconnect: the row becomes "Reconnecting" and gathers
+		-- the steps until the connection lands.
+		added.children = { { message = added.message, detail = added.detail } }
+		added.message = "Reconnecting\u{2026}"
+		added.detail = nil
+		added.level = "dim"
+		added.live = true
+		added.groupKind = "connect"
+		state.agentGroup = added
+	elseif (level == "ok" or level == "error")
+		and (string.sub(message, 1, 4) == "Done" or string.sub(message, 1, 6) == "Failed")
+	then
+		endGroup()
+		state.agentRunning = false
+	end
+
 	while #state.records > MAX_RECORDS do
-		table.remove(state.records, 1)
+		local evicted = table.remove(state.records, 1) :: Record
+		if evicted.widget ~= nil then
+			evicted.widget:Destroy()
+		end
 	end
 	redraw()
-	notify("log", { level, message, detail })
+	notify("log", { level, message, relayed, ms })
+end
+
+--[[
+	One row with sub-items: the row draws first, its items follow on a
+	connector, and after a few seconds they fold away until the row is hovered.
+]]
+function Console.logGroup(level: Level, message: string, children: { Child }, detail: string?)
+	local flat: { Child } = {}
+	for _, child in children do
+		table.insert(flat, {
+			message = Format.flatten(child.message),
+			detail = if child.detail ~= nil then Format.flatten(child.detail) else nil,
+		})
+	end
+	Console.log(level, message, detail, nil, flat)
 end
 
 export type Row = {
@@ -678,7 +1672,54 @@ export type Row = {
 	message: string,
 	detail: string?,
 	stamp: string,
+	turn: boolean?,
+	threaded: boolean?,
+	ms: number?,
+	kind: string?,
+	capped: boolean?,
+	children: { Child }?,
 }
+
+--[[
+	Closes the open turn, so what is logged next stands on its own again.
+
+	Called when a typed command has finished, when an agent the panel started
+	exits, and before anything that reports on the session as a whole. Calls
+	from an agent driven from a terminal never open a turn, so they are never
+	mistaken for the answer to a command typed here.
+]]
+--[[
+	Ends the open line on its last row with a cap, so a finished turn reads as
+	a line that stops rather than one that was cut off by the next.
+]]
+local function capTurn()
+	if not state.inTurn then
+		return
+	end
+	local last = state.records[#state.records]
+	if last == nil or not last.threaded or last.capped then
+		return
+	end
+	last.capped = true
+	local widget = last.widget
+	if widget ~= nil then
+		addCap(widget)
+	end
+end
+
+function Console.endTurn()
+	endGroup()
+	state.agentRunning = false
+	capTurn()
+	state.inTurn = false
+end
+
+function Console.endTurnUnlessBusy()
+	if not Prompt.isBusy() then
+		capTurn()
+		state.inTurn = false
+	end
+end
 
 --[[
 	The rows this console is holding, oldest first.
@@ -696,6 +1737,12 @@ function Console.snapshot(): { Row }
 			message = record.message,
 			detail = record.detail,
 			stamp = record.stamp,
+			turn = record.turn,
+			threaded = record.threaded,
+			ms = record.ms,
+			kind = record.kind,
+			capped = record.capped,
+			children = record.children,
 		})
 	end
 	return rows
@@ -720,11 +1767,19 @@ function Console.restore(rows: { Row })
 		-- A level from disk names a colour and a sigil; an unknown one would
 		-- render as `info` silently, so it is normalised here instead.
 		local level: Level = if LEVELS[row.level] ~= nil then (row.level :: any) else "dim"
+		state.nextOrder += 1
 		table.insert(state.records, {
+			order = state.nextOrder,
 			level = level,
 			message = row.message,
 			detail = row.detail,
 			stamp = row.stamp,
+			turn = row.turn,
+			threaded = row.threaded,
+			ms = row.ms,
+			kind = row.kind,
+			capped = row.capped,
+			children = row.children,
 		})
 	end
 	while #state.records > MAX_RECORDS do
@@ -741,12 +1796,6 @@ end
 	and heavier still. Urgency drives both the spin rate and how strongly the
 	colour takes over, so the two never disagree.
 ]]
-local KIND_LOOK: { [string]: { key: string, urgency: number } } = {
-	read = { key = "cyan", urgency = 0.3 },
-	write = { key = "violet", urgency = 0.7 },
-	run = { key = "green", urgency = 0.9 },
-	debug = { key = "amber", urgency = 0.5 },
-}
 
 --[[
 	Announces a command as it starts -- everywhere except the log.
@@ -765,8 +1814,7 @@ function Console.beginCall(title: string, kind: string)
 	state.running = title
 	state.generation += 1
 	local look = KIND_LOOK[kind] or KIND_LOOK.read
-	Visuals.setCaption(title)
-	Visuals.setKind(PALETTE[look.key], look.urgency)
+	state.lastKind = if KIND_LOOK[kind] then kind else "read"
 	refreshCounters()
 	notify("beginCall", { title, kind })
 end
@@ -776,6 +1824,9 @@ end
 	`log` so callers can log freely without skewing the statistics.
 ]]
 function Console.recordCall(ok: boolean, milliseconds: number)
+	-- A light runs across the background in the colour of the call's kind.
+	local look = KIND_LOOK[state.lastKind or "read"] or KIND_LOOK.read
+	Backdrop.pulse(if ok then PALETTE[look.key] else PALETTE.red)
 	state.calls += 1
 	state.totalMs += milliseconds
 	--[[
@@ -797,11 +1848,9 @@ function Console.recordCall(ok: boolean, milliseconds: number)
 	refreshCounters()
 	-- The footer reports totals when idle, so the band shows what just ran
 	-- instead of repeating the same word on the same screen.
-	Visuals.setIdle()
 
 	-- The band plots it: bar height is how long it took, colour is whether it
 	-- worked, and a failure knocks the solid off its axis as well.
-	Visuals.recordCall(milliseconds, ok, title)
 	notify("recordCall", { ok, milliseconds, title })
 
 	--[[
@@ -836,6 +1885,7 @@ function Console.recordCall(ok: boolean, milliseconds: number)
 		if Prompt.isBusy() then
 			return
 		end
+		Console.endTurn()
 		Console.log(
 			"dim",
 			string.format(
@@ -845,7 +1895,6 @@ function Console.recordCall(ok: boolean, milliseconds: number)
 				typicalText()
 			)
 		)
-		Visuals.setQuiet()
 	end)
 end
 
@@ -858,7 +1907,6 @@ end
 	"waiting for a command" forever when it is not waiting for one.
 ]]
 function Console.setCaption(message: string)
-	Visuals.setCaption(message)
 end
 
 --[[
@@ -879,8 +1927,8 @@ function Console.agentFinished()
 		watched live it announced a completed task for an agent that had simply
 		been closed mid-idle.
 	]]
+	Console.endTurn()
 	Console.log("ok", "Agent disconnected.", "client left")
-	Visuals.setQuiet()
 end
 
 --[[
@@ -909,7 +1957,6 @@ function Console.setClients(count: number, list: { Client }?)
 		times a session until it stopped meaning anything.
 	]]
 	if known and count > previous then
-		Visuals.celebrate()
 	end
 
 	local chip = state.clientsChip
@@ -918,7 +1965,7 @@ function Console.setClients(count: number, list: { Client }?)
 		-- ever correct because nobody can see it is a trap for whoever changes
 		-- the visibility rule later.
 		chip.Text = string.format(
-			"\u{25C6} %d client%s",
+			"%d agent%s",
 			count,
 			if count == 1 then "" else "s"
 		)
@@ -945,11 +1992,16 @@ function Console.setClients(count: number, list: { Client }?)
 			names can, so they are in the row that raises the question rather
 			than only in a panel the reader has to know to hover.
 		]]
-		Console.log(
-			"info",
-			string.format("%d MCP clients connected", count),
-			Console.clientSummary()
-		)
+		local items: { Child } = {}
+		for _, client in state.clientList do
+			local name = if client.name ~= "" then client.name else "unknown"
+			table.insert(items, { message = name .. (if client.version ~= "" then " " .. client.version else "") })
+		end
+		if #items > 0 then
+			Console.logGroup("info", string.format("%d MCP clients connected", count), items)
+		else
+			Console.log("info", string.format("%d MCP clients connected", count), Console.clientSummary())
+		end
 	end
 end
 
@@ -972,13 +2024,26 @@ end
 	plus a gap. The meta line then ends a fixed distance further left, which is
 	the rule it always followed -- it just no longer has to be told the answer.
 ]]
-local BUTTONS_WIDTH = 244
 local HEADER_GAP = 8
 local CHIP_WIDTH = 84
 local META_CLEARANCE = 150
 
 layoutHeader = function()
-	local edge = BUTTONS_WIDTH
+	--[[
+		Narrow docks drop the swatches first, then the meta line: the status word
+		and the controls are the part of the header nobody can do without.
+	]]
+	local buttons = state.headerButtons
+	local width = if buttons and buttons.Parent then (buttons.Parent :: GuiObject).AbsoluteSize.X else 1000
+	local wide = width >= NARROW_HEADER
+	local swatchRow = state.swatchRow
+	if swatchRow then
+		swatchRow.Visible = wide
+	end
+	local edge = if wide then BUTTONS_WIDE else BUTTONS_NARROW
+	if buttons then
+		buttons.Size = UDim2.new(0, edge, 0, ICON_BUTTON)
+	end
 
 	local chip = state.clientsChip
 	if chip then
@@ -993,6 +2058,7 @@ layoutHeader = function()
 	local meta = state.metaText
 	if meta then
 		meta.Size = UDim2.new(1, -(edge + META_CLEARANCE), 1, 0)
+		meta.Visible = width - edge - META_CLEARANCE >= 60
 	end
 end
 
@@ -1051,20 +2117,20 @@ function Console.reportClients()
 		end
 		return
 	end
-	Console.log("info", string.format("%d MCP client%s on this bridge", #list, if #list == 1 then "" else "s"))
 	local now = os.time()
+	local items: { Child } = {}
 	for _, client in list do
 		local name = if client.name ~= "" then client.name else "unknown"
 		local version = if client.version ~= "" then " " .. client.version else ""
 		-- Seconds since the epoch on both sides, so this is a real elapsed time
 		-- and not a guess: the bridge and Studio are the same machine.
 		local since = math.max(0, now - math.floor(client.connectedAt / 1000))
-		Console.log(
-			"dim",
-			string.format("   %s%s", name, version),
-			string.format("pid %d  %s", client.pid, Console.humanDuration(since))
-		)
+		table.insert(items, {
+			message = name .. version,
+			detail = string.format("pid %d \u{00B7} %s", client.pid, Console.humanDuration(since)),
+		})
 	end
+	Console.logGroup("info", string.format("%d MCP client%s on this bridge", #list, if #list == 1 then "" else "s"), items)
 end
 
 --[[
@@ -1102,7 +2168,7 @@ local function crtWipe()
 	local ghost = state.crtGhost
 	local line = state.crtLine
 	local scroller = state.scroller
-	local label = state.label
+	local list = state.list
 	if
 		shell == nil
 		or screen == nil
@@ -1110,7 +2176,7 @@ local function crtWipe()
 		or ghost == nil
 		or line == nil
 		or scroller == nil
-		or label == nil
+		or list == nil
 	then
 		return
 	end
@@ -1140,7 +2206,7 @@ local function crtWipe()
 	ghost.Position = UDim2.new(0, 12, 0, 8 - scroller.CanvasPosition.Y)
 	ghost.Size = UDim2.new(1, -24, 0, 0)
 	ghost.TextColor3 = PALETTE.text
-	ghost.Text = label.Text
+	ghost.Text = allText()
 
 	screen.BackgroundColor3 = PALETTE.background
 	screen.Size = UDim2.new(1, 0, 1, 0)
@@ -1208,7 +2274,10 @@ function Console.clear()
 		the one that went.
 	]]
 	local cleared = state.entries
+	state.inTurn = false
 	table.clear(state.records)
+	state.rebuild = true
+	state.unread = 0
 	state.entries = 0
 	state.calls = 0
 	state.errors = 0
@@ -1218,7 +2287,6 @@ function Console.clear()
 	-- The bars belonged to the log that just went. Leaving forty timings from an
 	-- erased session on screen while the footer reads "idle" is two answers to
 	-- one question.
-	Visuals.clearTrace()
 	redraw()
 
 	if cleared > 0 then
@@ -1257,18 +2325,38 @@ function Console.setStatus(status: string, meta: string)
 		else PALETTE.red
 
 	dot.TextColor3 = color
-	text.Text = string.upper(status)
-	text.TextColor3 = color
+	--[[
+		A live session breathes: the dot pulses while connected and holds still
+		otherwise, so "connected but frozen" and "connected and alive" stop
+		looking the same. One looping tween, replaced only when the state
+		changes, so a theme repaint does not restart it.
+	]]
+	if status ~= previous or state.statusPulse == nil then
+		if state.statusPulse then
+			state.statusPulse:Cancel()
+			state.statusPulse = nil
+		end
+		dot.TextTransparency = 0
+		if status == "connected" then
+			local pulse = TweenService:Create(
+				dot,
+				TweenInfo.new(1.1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+				{ TextTransparency = 0.55 }
+			)
+			pulse:Play()
+			state.statusPulse = pulse
+		end
+	end
+	text.Text = string.upper(string.sub(status, 1, 1)) .. string.sub(status, 2)
+	text.TextColor3 = if status == "connected" then PALETTE.text else color
 	metaLabel.Text = meta
 
 	-- The wireframe takes the same colour as the status light, so the panel
 	-- reads as disconnected at a glance even with the header off screen.
-	Visuals.setTint(color)
 
 	-- The trace has no calls to plot until a session exists, so it waves while
 	-- the transport is reaching for one rather than sitting as a dead baseline
 	-- at exactly the moment somebody is watching to see whether it is alive.
-	Visuals.setConnecting(status == "connecting")
 
 	--[[
 		And it celebrates when the session finally lands.
@@ -1279,7 +2367,6 @@ function Console.setStatus(status: string, meta: string)
 		several times a session, until it read as noise rather than as news.
 	]]
 	if status == "connected" and previous ~= "connected" then
-		Visuals.celebrate()
 	end
 
 	-- A roster learned on the old connection says nothing about this one.
@@ -1311,17 +2398,36 @@ local function themed<T>(instance: T & Instance, property: string, key: string):
 	return instance
 end
 
-local function makeButton(parent: Instance, text: string, order: number): TextButton
+
+--[[
+	The header's three controls, drawn rather than typed.
+
+	Code renders the geometric shapes the log's sigils use and nothing much
+	beyond them: the arrow and erase glyphs these started with came out as
+	empty boxes. So visuals keeps its diamond, which renders, and reconnect and
+	clear are built from Frames -- a ring with an arrowhead, a bin with a lid --
+	which draw the same in every font Studio will ever ship.
+]]
+type Ink = { instance: Instance, property: string }
+
+local function drawIcon(button: TextButton, kind: string): ({ Ink }, Icons.Drawn)
+	local drawn = Icons.draw(button, kind, PALETTE.dim)
+	local inks: { Ink } = {}
+	for _, line in drawn.paths do
+		table.insert(inks, { instance = line, property = "Color3" })
+	end
+	return inks, drawn
+end
+
+local function makeIconButton(parent: Instance, kind: string, tip: string, order: number): TextButton
 	local button = Instance.new("TextButton")
-	button.Name = text
-	button.Text = text
-	button.Font = Enum.Font.Code
-	button.TextSize = 11
-	themed(button, "TextColor3", "dim")
+	button.Name = kind
+	button.Text = ""
 	themed(button, "BackgroundColor3", "background")
 	button.AutoButtonColor = false
 	button.BorderSizePixel = 0
-	button.Size = UDim2.new(0, 76, 0, 20)
+	button.Size = UDim2.fromOffset(ICON_BUTTON, ICON_BUTTON)
+	button.BackgroundTransparency = 1
 	button.LayoutOrder = order
 	button.Parent = parent
 
@@ -1330,30 +2436,49 @@ local function makeButton(parent: Instance, text: string, order: number): TextBu
 	corner.Parent = button
 
 	local stroke = Instance.new("UIStroke")
-	themed(stroke, "Color", "dim")
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Color = PALETTE.dim
 	stroke.Transparency = 0.6
 	stroke.Parent = button
 
+	local inks, drawn = drawIcon(button, kind)
+	local hovered = false
+	button.Activated:Connect(function()
+		Icons.press(drawn)
+	end)
+	local function paint()
+		local key = button:GetAttribute("RestKey")
+		local color = if hovered then PALETTE.text else PALETTE[if typeof(key) == "string" then key else "dim"]
+		for _, entry in inks do
+			(entry.instance :: any)[entry.property] = color
+		end
+		stroke.Color = PALETTE.rule
+		stroke.Transparency = if hovered then 0.5 else 1
+		button.BackgroundTransparency = if hovered then 0.85 else 1
+	end
+
 	button.MouseEnter:Connect(function()
-		button.TextColor3 = PALETTE.violet
-		stroke.Color = PALETTE.violet
-		stroke.Transparency = 0.3
+		hovered = true
+		paint()
+		Icons.hover(drawn, true)
 	end)
 	button.MouseLeave:Connect(function()
-		button.TextColor3 = PALETTE.dim
-		stroke.Color = PALETTE.dim
-		stroke.Transparency = 0.6
+		hovered = false
+		paint()
+		Icons.hover(drawn, false)
 	end)
-
+	-- `RestKey` says which state a toggle is in; `Repaint` is bumped by a theme
+	-- switch, since the drawn parts are not on the themed role list.
+	button:GetAttributeChangedSignal("RestKey"):Connect(paint)
+	button:GetAttributeChangedSignal("Repaint"):Connect(paint)
+	paint()
 	return button
 end
 
 export type Handlers = {
 	onReconnect: () -> (),
 	onClear: () -> (),
-	-- Called after a preset switch has already been applied, so the caller's
-	-- only job is to remember it. Persistence lives there because
-	-- `plugin:SetSetting` is not reachable from a ModuleScript.
+	-- A theme dot was clicked; the theme is already active. Saves the choice.
 	onTheme: (string) -> (),
 	--[[
 		A line the user typed into the prompt row.
@@ -1381,16 +2506,29 @@ export type Handlers = {
 	is a console, and a console that repaints itself light grey reads as a form.
 ]]
 function Console.mount(parent: Instance, handlers: Handlers)
+	-- The saved theme is restored after this module loads, so the colours are
+	-- read again here; the cached ones would be the default theme's.
+	PALETTE = Palette.get()
 	local root = Instance.new("Frame")
 	root.Size = UDim2.fromScale(1, 1)
 	themed(root, "BackgroundColor3", "background")
 	root.BorderSizePixel = 0
 	root.Parent = parent
 
+	-- Navy field: lighter at the top left, deep at the bottom right.
+	local field = Instance.new("UIGradient")
+	field.Color = ColorSequence.new(PALETTE.background, Palette.deep())
+	state.fieldGradient = field
+	field.Rotation = 55
+	field.Parent = root
+
+	-- The drifting constellation, first so it draws under everything else.
+	Backdrop.mount(root, Palette.theme().backdrop, PALETTE.rule)
+
 	-- Header ---------------------------------------------------------------
 	local header = Instance.new("Frame")
-	header.Size = UDim2.new(1, 0, 0, 32)
-	themed(header, "BackgroundColor3", "surface")
+	header.Size = UDim2.new(1, 0, 0, HEADER_HEIGHT)
+	header.BackgroundTransparency = 1
 	header.BorderSizePixel = 0
 	header.Parent = root
 
@@ -1400,9 +2538,9 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	headerPadding.Parent = header
 
 	local dot = Instance.new("TextLabel")
-	dot.Text = "\u{25CF}"
+	dot.Text = "\u{25C6}"
 	dot.Font = Enum.Font.Code
-	dot.TextSize = 13
+	dot.TextSize = 11
 	-- Deliberately NOT registered with `themed`. Red here is the value it
 	-- STARTS at, not the colour it wears: what it should be is whatever
 	-- `setStatus` last reported. Registering it meant every theme switch
@@ -1414,26 +2552,26 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	state.statusDot = dot
 
 	local status = Instance.new("TextLabel")
-	status.Text = "DISCONNECTED"
-	status.Font = Enum.Font.Code
-	status.TextSize = 12
+	status.Text = "Disconnected"
+	status.Font = Palette.FONT_BOLD
+	status.TextSize = 14
 	status.TextColor3 = PALETTE.red
 	status.TextXAlignment = Enum.TextXAlignment.Left
 	status.BackgroundTransparency = 1
-	status.Position = UDim2.new(0, 18, 0, 0)
-	status.Size = UDim2.new(0, 110, 1, 0)
+	status.Position = UDim2.new(0, 16, 0, 0)
+	status.Size = UDim2.new(0, 92, 1, 0)
 	status.Parent = header
 	state.statusText = status
 
 	local meta = Instance.new("TextLabel")
 	meta.Text = ""
-	meta.Font = Enum.Font.Code
-	meta.TextSize = 11
+	meta.Font = Palette.FONT
+	meta.TextSize = 13
 	themed(meta, "TextColor3", "dim")
 	meta.TextXAlignment = Enum.TextXAlignment.Left
 	meta.TextTruncate = Enum.TextTruncate.AtEnd
 	meta.BackgroundTransparency = 1
-	meta.Position = UDim2.new(0, 132, 0, 0)
+	meta.Position = UDim2.new(0, 110, 0, 0)
 	meta.Size = UDim2.new(1, -394, 1, 0)
 	meta.Parent = header
 	state.metaText = meta
@@ -1451,11 +2589,12 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	clientsChip.AnchorPoint = Vector2.new(1, 0.5)
 	clientsChip.Position = UDim2.new(1, -252, 0.5, 0)
 	clientsChip.Size = UDim2.new(0, 84, 0, 18)
-	themed(clientsChip, "BackgroundColor3", "background")
+	clientsChip.BackgroundColor3 = PALETTE.rule
+	clientsChip.BackgroundTransparency = 1
 	clientsChip.BorderSizePixel = 0
-	clientsChip.Font = Enum.Font.Code
-	clientsChip.TextSize = 11
-	themed(clientsChip, "TextColor3", "cyan")
+	clientsChip.Font = Palette.FONT
+	clientsChip.TextSize = 13
+	themed(clientsChip, "TextColor3", "dim")
 	clientsChip.Text = ""
 	clientsChip.AutoButtonColor = false
 	clientsChip.Visible = false
@@ -1473,47 +2612,95 @@ function Console.mount(parent: Instance, handlers: Handlers)
 		back to and acted on.
 	]]
 	clientsChip.MouseEnter:Connect(function()
-		Visuals.showNote(Console.clientSummary())
+		clientsChip.TextColor3 = PALETTE.text
+		clientsChip.BackgroundTransparency = 0.88
 	end)
 	clientsChip.MouseLeave:Connect(function()
-		Visuals.clearNote()
+		clientsChip.TextColor3 = PALETTE.dim
+		clientsChip.BackgroundTransparency = 1
 	end)
 	clientsChip.Activated:Connect(function()
 		Console.reportClients()
 	end)
 
-	local chipCorner = Instance.new("UICorner")
-	chipCorner.CornerRadius = UDim.new(0, 3)
-	chipCorner.Parent = clientsChip
-
-	local chipStroke = Instance.new("UIStroke")
-	themed(chipStroke, "Color", "cyan")
-	chipStroke.Transparency = 0.6
-	chipStroke.Parent = clientsChip
 
 	local buttons = Instance.new("Frame")
 	buttons.AnchorPoint = Vector2.new(1, 0.5)
 	buttons.Position = UDim2.new(1, 0, 0.5, 0)
-	buttons.Size = UDim2.new(0, 244, 0, 20)
+	buttons.Size = UDim2.new(0, BUTTONS_WIDE, 0, ICON_BUTTON)
 	buttons.BackgroundTransparency = 1
 	buttons.Parent = header
+	state.headerButtons = buttons
 
 	local buttonLayout = Instance.new("UIListLayout")
 	buttonLayout.FillDirection = Enum.FillDirection.Horizontal
 	buttonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
 	buttonLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-	buttonLayout.Padding = UDim.new(0, 6)
+	buttonLayout.Padding = UDim.new(0, 4)
 	buttonLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	buttonLayout.Parent = buttons
 
-	local visualsButton = makeButton(buttons, "visuals", 1)
-	makeButton(buttons, "reconnect", 2).MouseButton1Click:Connect(handlers.onReconnect)
-	makeButton(buttons, "clear", 3).MouseButton1Click:Connect(handlers.onClear)
+	--[[
+		Theme dots: one diamond per theme in its own colour; the active one is
+		ringed. Clicking switches the whole panel live.
+	]]
+	local swatchRow = Instance.new("Frame")
+	swatchRow.Name = "Themes"
+	swatchRow.BackgroundTransparency = 1
+	swatchRow.Size = UDim2.fromOffset(SWATCHES_WIDTH, ICON_BUTTON)
+	swatchRow.LayoutOrder = 0
+	swatchRow.Parent = buttons
+	state.swatchRow = swatchRow
+	local swatchLayout = Instance.new("UIListLayout")
+	swatchLayout.FillDirection = Enum.FillDirection.Horizontal
+	swatchLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	swatchLayout.Padding = UDim.new(0, SWATCH_GAP)
+	swatchLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	swatchLayout.Parent = swatchRow
+	for order, theme in Palette.list() do
+		local swatch = Instance.new("TextButton")
+		swatch.Name = theme.id
+		swatch.Text = ""
+		swatch.AutoButtonColor = false
+		swatch.BorderSizePixel = 0
+		swatch.Rotation = 45
+		swatch.Size = UDim2.fromOffset(SWATCH - 2, SWATCH - 2)
+		swatch.BackgroundColor3 = theme.accent
+		swatch.LayoutOrder = order
+		swatch.Parent = swatchRow
+		local ring = Instance.new("UIStroke")
+		ring.Name = "Ring"
+		ring.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		ring.Thickness = 1.5
+		ring.Parent = swatch
+		swatch.MouseEnter:Connect(function()
+			swatch.Size = UDim2.fromOffset(SWATCH, SWATCH)
+		end)
+		swatch.MouseLeave:Connect(function()
+			swatch.Size = UDim2.fromOffset(SWATCH - 2, SWATCH - 2)
+		end)
+		swatch.Activated:Connect(function()
+			if Palette.use(theme.id) then
+				Console.applyTheme()
+				handlers.onTheme(theme.id)
+			end
+		end)
+		state.swatches[theme.id] = swatch
+	end
+	Console.paintSwatches()
+
+	makeIconButton(buttons, "reconnect", "reconnect to the bridge", 2).Activated:Connect(handlers.onReconnect)
+	makeIconButton(buttons, "clear", "clear the log", 3).Activated:Connect(handlers.onClear)
+
+	header:GetPropertyChangedSignal("AbsoluteSize"):Connect(layoutHeader)
+	task.defer(function()
+		layoutHeader()
+	end)
 
 	-- Accent rule under the header. One hairline in the signature violet is what
 	-- separates this from every other grey dock in Studio.
 	local rule = Instance.new("Frame")
-	rule.Position = UDim2.new(0, 0, 0, 32)
+	rule.Position = UDim2.new(0, 0, 0, HEADER_HEIGHT)
 	rule.Size = UDim2.new(1, 0, 0, 1)
 	themed(rule, "BackgroundColor3", "rule")
 	rule.BorderSizePixel = 0
@@ -1523,8 +2710,8 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	ruleFade.Color = ColorSequence.new(PALETTE.rule)
 	state.ruleFade = ruleFade
 	ruleFade.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0.15),
-		NumberSequenceKeypoint.new(1, 0.85),
+		NumberSequenceKeypoint.new(0, 0.6),
+		NumberSequenceKeypoint.new(1, 0.6),
 	})
 	ruleFade.Parent = rule
 
@@ -1535,7 +2722,7 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	scroller.BackgroundTransparency = 1
 	scroller.BorderSizePixel = 0
 	scroller.ScrollBarThickness = 5
-	themed(scroller, "ScrollBarImageColor3", "violet")
+	themed(scroller, "ScrollBarImageColor3", "rule")
 	scroller.ScrollBarImageTransparency = 0.5
 	scroller.CanvasSize = UDim2.new()
 	scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
@@ -1546,25 +2733,27 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	local logPadding = Instance.new("UIPadding")
 	logPadding.PaddingTop = UDim.new(0, 8)
 	logPadding.PaddingBottom = UDim.new(0, 8)
-	logPadding.PaddingLeft = UDim.new(0, 12)
-	logPadding.PaddingRight = UDim.new(0, 12)
+	logPadding.PaddingLeft = UDim.new(0, 8)
+	logPadding.PaddingRight = UDim.new(0, 8)
 	logPadding.Parent = scroller
 
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 0, 0)
-	label.AutomaticSize = Enum.AutomaticSize.Y
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.Code
-	label.TextSize = 12
-	label.LineHeight = 1.25
-	themed(label, "TextColor3", "text")
-	label.RichText = true
-	label.TextWrapped = true
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextYAlignment = Enum.TextYAlignment.Top
-	label.Text = ""
-	label.Parent = scroller
-	state.label = label
+	-- One row per record lives in here; see `paint`.
+	local list = Instance.new("Frame")
+	list.Name = "Log"
+	-- Narrowed by the scroller's side padding by hand: a scale width inside a
+	-- ScrollingFrame measures against the canvas, which UIPadding does not
+	-- shrink, so a full-width log ran 12px past the panel's right edge.
+	list.Size = UDim2.new(1, -16, 0, 0)
+	list.AutomaticSize = Enum.AutomaticSize.Y
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.Parent = scroller
+	state.list = list
+
+	local listLayout = Instance.new("UIListLayout")
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Padding = UDim.new(0, 0)
+	listLayout.Parent = list
 
 	--[[
 		The clear wipe's overlay, built once and hidden.
@@ -1650,6 +2839,7 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	footer.Position = UDim2.fromScale(0, 1)
 	footer.Size = UDim2.new(1, 0, 0, FOOTER_HEIGHT)
 	themed(footer, "BackgroundColor3", "surface")
+	footer.BackgroundTransparency = 0.4
 	footer.BorderSizePixel = 0
 	footer.Parent = root
 
@@ -1659,10 +2849,10 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	footerPadding.Parent = footer
 
 	local prompt = Instance.new("TextLabel")
-	prompt.Text = "rbx\u{00B7}studio"
-	prompt.Font = Enum.Font.Code
-	prompt.TextSize = 11
-	themed(prompt, "TextColor3", "violet")
+	prompt.Text = "rbx-studio"
+	prompt.Font = Palette.FONT
+	prompt.TextSize = 12
+	themed(prompt, "TextColor3", "dim")
 	prompt.TextXAlignment = Enum.TextXAlignment.Left
 	prompt.BackgroundTransparency = 1
 	prompt.Size = UDim2.new(0, 70, 1, 0)
@@ -1679,8 +2869,8 @@ function Console.mount(parent: Instance, handlers: Handlers)
 
 	local counters = Instance.new("TextLabel")
 	counters.Text = "idle"
-	counters.Font = Enum.Font.Code
-	counters.TextSize = 11
+	counters.Font = Palette.FONT
+	counters.TextSize = 12
 	themed(counters, "TextColor3", "dim")
 	counters.TextXAlignment = Enum.TextXAlignment.Right
 	counters.BackgroundTransparency = 1
@@ -1689,6 +2879,7 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	counters.Size = UDim2.new(1, -90, 1, 0)
 	counters.Parent = footer
 	state.countersText = counters
+
 
 	--[[
 		The band sits above the log and pushes it down, rather than over it.
@@ -1721,45 +2912,21 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	promptRow.Position = UDim2.new(0, 0, 1, -FOOTER_HEIGHT)
 	promptRow.Size = UDim2.new(1, 0, 0, Prompt.HEIGHT)
 
-	Visuals.mount(root)
-	local band = root:FindFirstChild("ActivityBand") :: Frame
-	band.Position = UDim2.new(0, 0, 0, 33)
-	band.Size = UDim2.new(1, 0, 0, Visuals.BAND_HEIGHT)
-
-	-- The log's top edge follows the band, so turning it on never hides a line.
-	-- Its bottom edge clears the prompt and the status bar, which do not move.
+	-- The log fills what the header, the prompt and the status bar leave.
 	local function layoutLog()
-		local top = 33 + (if Visuals.isVisible() then Visuals.BAND_HEIGHT else 0)
+		local top = HEADER_HEIGHT + 1
 		scroller.Position = UDim2.new(0, 0, 0, top)
 		scroller.Size = UDim2.new(1, 0, 1, -(top + FOOTER_HEIGHT + Prompt.HEIGHT))
 	end
 	state.relayout = layoutLog
-
-	-- On by default. It is the part that says the session is alive, and a signal
-	-- nobody discovers is not a signal; anyone who wants the extra 44px back can
-	-- turn it off in one click.
-	Visuals.setVisible(true)
-	visualsButton.Text = utf8.char(0x25C6) .. " visuals"
-	Visuals.setIdle()
 	layoutLog()
 
-	state.visualsButton = visualsButton
-	visualsButton.MouseButton1Click:Connect(function()
-		Console.toggleVisuals()
-	end)
-
-	--[[
-		The preset drawer, mounted last so its tab sits over everything.
-
-		It has to be the last child of `root` as well as the highest ZIndex: the
-		band, the log and the footer are all built before it and a drawer that
-		opens behind the log is a drawer nobody can click.
-	]]
-	ThemePicker.mount(root, function(id)
-		Console.applyTheme()
-		ThemePicker.applyTheme()
-		layoutLog()
-		handlers.onTheme(id)
+	-- A click on the log's empty background wakes the theme's animation.
+	-- Rows are buttons and take their own clicks, so only open space gets here.
+	scroller.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and not Prompt.isMenuOpen() then
+			Backdrop.click(Vector2.new(input.Position.X, input.Position.Y), PALETTE.rule)
+		end
 	end)
 
 	-- Treat "scrolled away from the bottom" as the user reading history, and
@@ -1767,32 +2934,65 @@ function Console.mount(parent: Instance, handlers: Handlers)
 	scroller:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
 		local maxScroll = math.max(0, scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y)
 		state.pinned = maxScroll - scroller.CanvasPosition.Y < 24
+		if state.pinned then
+			state.unread = 0
+		end
+		updateJumpPill()
 	end)
-end
 
---[[
-	Shows or hides the activity band, from the button or from `visuals`.
+	-- Rows size themselves a frame after they are added, so following the tail
+	-- from `paint` alone lands one row short. Following the canvas itself does
+	-- not.
+	scroller:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+		if state.pinned and not state.hoverHold then
+			local maxScroll = math.max(0, scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y)
+			scroller.CanvasPosition = Vector2.new(0, maxScroll)
+		end
+	end)
 
-	One implementation for two callers. The button used to own this outright,
-	which meant the command could either duplicate the three lines it takes --
-	and go stale the day one of them changes -- or leave the button's own label
-	saying the opposite of what the panel was doing.
-]]
-function Console.toggleVisuals(): boolean
-	local wanted = not Visuals.isVisible()
-	Visuals.setVisible(wanted)
-	local relayout = state.relayout
-	if relayout then
-		relayout()
-	end
-	local button = state.visualsButton
-	if button then
-		-- The button reports the state it is in, not the state it would move to.
-		-- A toggle that reads as an instruction is ambiguous the moment you look
-		-- away and back.
-		button.Text = if wanted then utf8.char(0x25C6) .. " visuals" else "visuals"
-	end
-	return wanted
+	-- Offers the way back to the tail once the user has scrolled away from it.
+	local pill = Instance.new("TextButton")
+	pill.Name = "JumpToLatest"
+	pill.AnchorPoint = Vector2.new(1, 1)
+	pill.Position = UDim2.new(1, -16, 1, -(FOOTER_HEIGHT + Prompt.HEIGHT + 8))
+	pill.Size = UDim2.new(0, 76, 0, 22)
+	pill.Font = Palette.FONT_MEDIUM
+	pill.TextSize = 12
+	pill.AutoButtonColor = false
+	pill.BorderSizePixel = 0
+	pill.ZIndex = 10
+	pill.Visible = false
+	pill.BackgroundColor3 = Palette.deep()
+	pill.BackgroundTransparency = 0.2
+	themed(pill, "TextColor3", "text")
+	pill.Parent = root
+	state.jumpPill = pill
+
+
+	local pillCorner = Instance.new("UICorner")
+	pillCorner.CornerRadius = UDim.new(1, 0)
+	pillCorner.Parent = pill
+
+	local pillStroke = Instance.new("UIStroke")
+	-- Border, not Contextual: on a button the default outlines the text.
+	pillStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	themed(pillStroke, "Color", "rule")
+	pillStroke.Transparency = 0.45
+	pill.MouseEnter:Connect(function()
+		pillStroke.Transparency = 0.1
+	end)
+	pill.MouseLeave:Connect(function()
+		pillStroke.Transparency = 0.45
+	end)
+	pillStroke.Parent = pill
+
+	pill.Activated:Connect(function()
+		state.pinned = true
+		state.unread = 0
+		scroller.CanvasPosition = Vector2.new(0, math.max(0, scroller.AbsoluteCanvasSize.Y))
+		updateJumpPill()
+	end)
+	updateJumpPill()
 end
 
 --[[
@@ -1813,6 +3013,7 @@ function Console.setFilter(levels: { string }?)
 		end
 		state.filter = wanted
 	end
+	state.rebuild = true
 	redraw()
 end
 
@@ -1832,8 +3033,10 @@ end
 function Console.plainText(): string
 	local lines: { string } = { "-- rbx-studio console log" }
 	for _, record in state.records do
-		local sigil = (LEVELS[record.level] or LEVELS.info).sigil
-		local detail = if record.detail ~= nil then "    " .. record.detail else ""
+		local sigil = if record.turn then "\u{203A}" else (LEVELS[record.level] or LEVELS.info).sigil
+		-- Typed lines say so, as they did before the thread replaced "you".
+		local shown = if record.turn then (record.detail or "you") else record.detail
+		local detail = if shown ~= nil then "    " .. shown else ""
 		table.insert(
 			lines,
 			string.format("-- %s %s %s%s", record.stamp, sigil, record.message, detail)
@@ -1867,7 +3070,6 @@ end
 ]]
 function Console.setPromptBusy(busy: boolean)
 	Prompt.setBusy(busy)
-	Visuals.setThinking(busy)
 end
 
 -- Whether the prompt row invites sentences. See `chat` in Commands.
@@ -1875,40 +3077,88 @@ function Console.setPromptChat(enabled: boolean)
 	Prompt.setChat(enabled)
 end
 
---[[
-	Switches the whole panel to the active preset.
+-- Rings the active theme's dot and dims the rest.
+function Console.paintSwatches()
+	local active = Palette.theme().id
+	for id, dot in state.swatches do
+		local ring = dot:FindFirstChild("Ring") :: UIStroke?
+		if ring then
+			ring.Color = PALETTE.text
+			ring.Transparency = if id == active then 0 else 1
+		end
+		dot.BackgroundTransparency = if id == active then 0 else 0.35
+	end
+end
 
-	Three things have to move together or the switch looks broken: the palette
-	this file reads, the Instances that copied a colour out of it, and the log,
-	whose rows are re-rendered from records rather than recoloured in place. The
-	band goes last because remounting a preset is the expensive part and there
-	is no reason to make the text wait for it.
+--[[
+	Repaints the whole panel in the active theme: every registered colour, the
+	background gradient and effect, the prompt, the header icons, and the log,
+	whose rows are rebuilt so they pick up the new colours.
 ]]
 function Console.applyTheme()
-	PALETTE = Themes.palette()
-
+	PALETTE = Palette.get()
 	for _, role in roles do
-		-- A widget can outlive its registration if the panel is rebuilt, and
-		-- writing to a destroyed Instance throws.
 		if role.instance.Parent ~= nil or role.instance:IsA("UIStroke") then
 			pcall(function()
 				(role.instance :: any)[role.property] = PALETTE[role.key]
 			end)
 		end
 	end
-
+	local field = state.fieldGradient
+	if field then
+		field.Color = ColorSequence.new(PALETTE.background, Palette.deep())
+	end
 	local ruleFade = state.ruleFade
 	if ruleFade then
 		ruleFade.Color = ColorSequence.new(PALETTE.rule)
 	end
-
-	refreshCounters()
-	-- Replayed rather than recoloured: the status light's colour is a fact about
-	-- the connection, and the only thing that knows it is `setStatus`.
+	local pill = state.jumpPill
+	if pill then
+		pill.BackgroundColor3 = Palette.deep()
+	end
+	Backdrop.show(Palette.theme().backdrop, PALETTE.rule)
 	Console.setStatus(state.status, state.statusMeta)
-	redraw()
+	refreshCounters()
 	Prompt.applyTheme()
-	Visuals.applyTheme()
+	local buttons = state.headerButtons
+	if buttons then
+		for _, child in buttons:GetChildren() do
+			if child:IsA("TextButton") then
+				child:SetAttribute("Repaint", ((child:GetAttribute("Repaint") or 0) :: number) + 1)
+			end
+		end
+	end
+	Console.paintSwatches()
+	--[[
+		Built rows are recoloured where they stand rather than rebuilt: with a
+		full log a rebuild was hundreds of rows in one frame, and it cut off
+		every animation in flight. Spread over a few frames so a full log does
+		not hitch either.
+	]]
+	state.repaintGeneration = (state.repaintGeneration or 0) + 1
+	local generation = state.repaintGeneration
+	local pending: { Record } = {}
+	for index = #state.records, 1, -1 do
+		local record = state.records[index]
+		if record.widget ~= nil and record.repaint ~= nil then
+			table.insert(pending, record)
+		end
+	end
+	task.spawn(function()
+		-- Newest first, since that is the end of the log on screen.
+		for index, record in pending do
+			if state.repaintGeneration ~= generation then
+				return
+			end
+			if record.widget ~= nil and record.repaint ~= nil then
+				record.repaint()
+			end
+			if index % 60 == 0 then
+				task.wait()
+			end
+		end
+	end)
+	redraw()
 end
 
 return Console

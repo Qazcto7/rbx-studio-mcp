@@ -28,10 +28,9 @@ local ServerStorage = game:GetService("ServerStorage")
 local Config = require(script.Parent.Config)
 local Playtest = require(script.Parent.handlers.Playtest)
 local Console = require(script.Parent.Console)
+local Palette = require(script.Parent.Palette)
 local Net = require(script.Parent.Net)
 local Secret = require(script.Parent.Secret)
-local ThemePicker = require(script.Parent.ThemePicker)
-local Themes = require(script.Parent.Themes)
 
 local Commands = {}
 
@@ -42,10 +41,17 @@ export type Hooks = {
 	-- `plugin:SetSetting` is not reachable from a ModuleScript, so anything that
 	-- has to outlive the session is handed back to the script that can persist it.
 	savePort: (number) -> (),
-	saveTheme: (string) -> (),
 	-- Whether the panel may open itself on load, and the setter for it.
 	autoOpen: () -> boolean,
 	saveAutoOpen: (boolean) -> (),
+	playPanel: () -> boolean,
+	background: () -> boolean,
+	saveTheme: (string) -> (),
+	saveBackground: (boolean) -> (),
+	savePlayPanel: (boolean) -> (),
+	-- Where the playtest panel opens: "float" or a dock side.
+	playDock: () -> string,
+	savePlayDock: (string) -> (),
 	-- Whether a line that is not a command is sent to an agent, and the setter.
 	chat: () -> boolean,
 	saveChat: (boolean) -> (),
@@ -68,6 +74,9 @@ type Entry = {
 	-- Answered by the bridge rather than here. Listed all the same: a user
 	-- should not have to know which side of the wire a command lives on.
 	remote: boolean?,
+	-- Still runs when typed, but is left out of `help` and the menu: the panel
+	-- offers a button for it instead.
+	hidden: boolean?,
 	run: ((args: { string }) -> ())?,
 }
 
@@ -138,7 +147,9 @@ define({
 	run = function()
 		Console.log("info", "commands")
 		for _, entry in entries do
-			Console.log("dim", "   " .. entry.usage, entry.summary)
+			if not entry.hidden then
+				Console.log("dim", "   " .. entry.usage, entry.summary)
+			end
 		end
 		local current = hooks
 		if current ~= nil and current.chat() then
@@ -177,7 +188,7 @@ define({
 define({
 	name = "status",
 	usage = "status",
-	summary = "connection, bridge, build and theme",
+	summary = "connection, bridge and build",
 	run = function()
 		local current = hooks
 		Console.log("info", "session")
@@ -197,7 +208,6 @@ define({
 				Config.PROTOCOL_VERSION
 			)
 		)
-		Console.log("dim", "   theme", Themes.activeId())
 	end,
 })
 
@@ -207,57 +217,6 @@ define({
 	summary = "which MCP clients share this bridge",
 	run = function()
 		Console.reportClients()
-	end,
-})
-
-define({
-	name = "theme",
-	usage = "theme [name]",
-	summary = "switch colour preset, or list them",
-	run = function(args)
-		local wanted = args[1]
-		if wanted == nil then
-			local active = Themes.activeId()
-			Console.log("info", "themes")
-			for _, theme in Themes.list() do
-				Console.log(
-					if theme.id == active then "ok" else "dim",
-					"   " .. theme.id,
-					if theme.id == active then "in use" else nil
-				)
-			end
-			return
-		end
-
-		-- `Themes.use` answers false both for an unknown id and for re-picking
-		-- the current one, so the two are separated here rather than reported as
-		-- the same shrug.
-		if wanted == Themes.activeId() then
-			Console.log("dim", string.format("already on %s", wanted))
-			return
-		end
-		if not Themes.use(wanted) then
-			Console.log("error", string.format("no theme called %q", wanted), "run `theme` to list them")
-			return
-		end
-
-		Console.applyTheme()
-		ThemePicker.applyTheme()
-		local current = hooks
-		if current then
-			current.saveTheme(wanted)
-		end
-		Console.log("ok", string.format("theme: %s", wanted))
-	end,
-})
-
-define({
-	name = "visuals",
-	usage = "visuals",
-	summary = "show or hide the activity band",
-	run = function()
-		local shown = Console.toggleVisuals()
-		Console.log("dim", if shown then "visuals on" else "visuals off")
 	end,
 })
 
@@ -286,6 +245,109 @@ define({
 })
 
 define({
+	name = "theme",
+	usage = "theme [name]",
+	summary = "switch the panel's theme, or list them",
+	run = function(args)
+		local wanted = args[1]
+		local active = Palette.theme().id
+		if wanted == nil then
+			local items = {}
+			for _, theme in Palette.list() do
+				table.insert(items, {
+					message = theme.label .. (if theme.id == active then "  (in use)" else ""),
+					detail = theme.blurb,
+				})
+			end
+			Console.logGroup("info", "themes", items)
+			return
+		end
+		local found = Palette.find(wanted)
+		if found == nil then
+			Console.log("error", string.format("no theme called %q", wanted), "run `theme` to list them")
+			return
+		end
+		if found.id == active then
+			Console.log("dim", string.format("already on %s", found.label))
+			return
+		end
+		Palette.use(found.id)
+		Console.applyTheme()
+		local current = hooks
+		if current then
+			current.saveTheme(found.id)
+		end
+		Console.log("ok", string.format("theme: %s", found.label))
+	end,
+})
+
+define({
+	name = "background",
+	usage = "background [on|off]",
+	summary = "the moving constellation behind the log",
+	run = function(args)
+		local current = hooks
+		if current == nil then
+			return
+		end
+		local wanted = args[1]
+		if wanted == nil then
+			Console.log("dim", if current.background() then "background on" else "background off")
+			return
+		end
+		if wanted ~= "on" and wanted ~= "off" then
+			Console.log("error", string.format("%q is not on or off", wanted), "background [on|off]")
+			return
+		end
+		current.saveBackground(wanted == "on")
+		Console.log("ok", "background " .. wanted)
+	end,
+})
+
+define({
+	name = "playpanel",
+	usage = "playpanel [on|off|left|right|bottom|float]",
+	summary = "open this panel during playtests, docked or floating",
+	run = function(args)
+		local current = hooks
+		if current == nil then
+			return
+		end
+		local usage = "playpanel [on|off|left|right|bottom|float]"
+		local wanted = args[1]
+		if wanted == nil then
+			Console.log(
+				"dim",
+				if current.playPanel()
+					then string.format("playpanel on, %s -- the panel opens with Play", current.playDock())
+					else "playpanel off -- the panel stays hidden during playtests"
+			)
+			return
+		end
+		wanted = string.lower(wanted)
+		local isDock = wanted == "left" or wanted == "right" or wanted == "bottom" or wanted == "float"
+		if wanted ~= "on" and wanted ~= "off" and not isDock then
+			Console.log("error", string.format("%q is not a playpanel option", wanted), usage)
+			return
+		end
+		local value = wanted ~= "off"
+		if value == current.playPanel() and (not isDock or wanted == current.playDock()) then
+			Console.log("dim", string.format("already playpanel %s", wanted))
+			return
+		end
+		if isDock then
+			current.savePlayDock(wanted)
+		end
+		current.savePlayPanel(value)
+		Console.log(
+			"ok",
+			if value then string.format("playpanel on, %s", current.playDock()) else "playpanel off",
+			"applies from the next playtest"
+		)
+	end,
+})
+
+define({
 	name = "autoopen",
 	usage = "autoopen [on|off]",
 	summary = "let this panel open itself, or only ever from the toolbar",
@@ -300,7 +362,7 @@ define({
 			Console.log(
 				"dim",
 				if current.autoOpen()
-					then "autoopen on -- the panel opens with the place, and with Play"
+					then "autoopen on -- the panel opens with the place"
 					else "autoopen off -- the panel opens only from the toolbar button"
 			)
 			return
@@ -551,7 +613,8 @@ define({
 	summary = "which coding agent runs your prompts",
 	remote = true,
 })
-define({ name = "stop", usage = "stop", summary = "cancel the running agent", remote = true })
+-- Cancelled from the stop button beside the prompt; typing it still works.
+define({ name = "stop", usage = "stop", summary = "cancel the running agent", remote = true, hidden = true })
 --[[
 	Remote on purpose, and not only because the server does the HTTP.
 
@@ -565,7 +628,15 @@ define({ name = "stop", usage = "stop", summary = "cancel the running agent", re
 define({
 	name = "cloud",
 	usage = "cloud [key|user|group|universe|place|test|forget]",
-	summary = "the Open Cloud key `upload` uses",
+	summary = "the Open Cloud key, creator, universe and place",
+	remote = true,
+})
+-- Answered by the server, which holds the per-game permissions file. Only
+-- reading is on until the user allows more here.
+define({
+	name = "allow",
+	usage = "allow [read|assets|data|edit|money|players] [off]",
+	summary = "what agents may do in this game through Open Cloud",
 	remote = true,
 })
 
@@ -598,7 +669,7 @@ export type Suggestion = {
 function Commands.suggest(prefix: string): { Suggestion }
 	local matches: { Suggestion } = {}
 	for _, entry in entries do
-		if string.sub(entry.name, 1, #prefix) == prefix then
+		if not entry.hidden and string.sub(entry.name, 1, #prefix) == prefix then
 			table.insert(matches, {
 				name = entry.name,
 				usage = entry.usage,
@@ -660,7 +731,7 @@ end
 	so a remote command is free to block on the bridge without freezing the
 	field the user is typing into.
 ]]
-function Commands.run(line: string)
+local function runLine(line: string)
 	local trimmed = string.match(line, "^%s*(.-)%s*$") or ""
 	if trimmed == "" then
 		return
@@ -734,6 +805,18 @@ function Commands.run(line: string)
 			Console.log("error", string.format("%s failed", entry.name), tostring(err))
 		end
 	end
+end
+
+--[[
+	Runs one line from the prompt, then closes its turn.
+
+	A command's output is finished by the time it returns, so its turn ends
+	here. A sentence handed to an agent is still running, and its turn stays
+	open until the bridge reports the run has ended.
+]]
+function Commands.run(line: string)
+	runLine(line)
+	Console.endTurnUnlessBusy()
 end
 
 return Commands

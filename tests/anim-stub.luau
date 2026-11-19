@@ -114,6 +114,7 @@ local script = {
 		Parent = {
 			Paths = make("Paths"),
 			Dispatch = make("Dispatch"),
+			Handles = make("Handles"),
 		},
 	},
 }

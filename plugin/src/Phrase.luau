@@ -116,6 +116,12 @@ local DESCRIBERS: { [string]: Describer } = {
 	["sync.log"] = function()
 		return "Sync note"
 	end,
+	["analysis.publish"] = function()
+		return "Show Luau check in Script Analysis"
+	end,
+	["analysis.clear"] = function()
+		return "Clear Luau check findings"
+	end,
 	["sync.classes"] = function(params)
 		return "List classes in " .. (leaf(params.path) or "tree")
 	end,
@@ -327,6 +333,12 @@ local DESCRIBERS: { [string]: Describer } = {
 	["debug.remotes"] = function()
 		return "Observe playtest RemoteEvent traffic"
 	end,
+	["debug.watch"] = function(params)
+		return "Watch changes to " .. (leaf(params.path) or "an instance")
+	end,
+	["debug.collisions"] = function(params)
+		return "Watch collisions on " .. (leaf(params.path) or "an instance")
+	end,
 	["debug.snapshots"] = function()
 		return "Read what the breakpoints caught"
 	end,
@@ -348,6 +360,9 @@ local DESCRIBERS: { [string]: Describer } = {
 	end,
 	["perf.profile"] = function(params)
 		return string.format("Profile scripts for %ss", tostring(params.seconds or 5))
+	end,
+	["perf.microprofile"] = function(params)
+		return string.format("Capture %s MicroProfiler frames", tostring(params.frames or 64))
 	end,
 	["perf.coverage"] = function(params)
 		local total = count(params.enable)
@@ -438,6 +453,15 @@ local DESCRIBERS: { [string]: Describer } = {
 	["viewport.raycast"] = function()
 		return "Cast a ray"
 	end,
+	["viewport.pick"] = function()
+		return "Identify the instance at a viewport point"
+	end,
+	["exec.result"] = function()
+		return "Retrieve a retained execution result"
+	end,
+	["client.read"] = function(params)
+		return "Read the playtest client: " .. tostring(params.op)
+	end,
 
 	["capture.screenshot"] = function()
 		return "Take a screenshot"
@@ -512,6 +536,11 @@ local DESCRIBERS: { [string]: Describer } = {
 
 	["spatial.cast"] = function(params)
 		local shape = tostring(params.shape or "ray")
+		-- A part sweep names the part; it has no `from` unless overridden, and
+		-- "Cast a part from ?" read as a broken call.
+		if shape == "part" then
+			return string.format("Sweep %s", leaf(params.path) or "a part")
+		end
 		local target = if params.to ~= nil then tostring(params.to) else nil
 		if target ~= nil then
 			return string.format("Cast a %s at %s", shape, target)
@@ -541,6 +570,10 @@ local DESCRIBERS: { [string]: Describer } = {
 	["audio.inspect"] = function(params)
 		local name = leaf(params.path)
 		return if name ~= nil then "Read the audio graph in " .. name else "Read the audio graph"
+	end,
+	["audio.speech"] = function(params)
+		local lines = if typeof(params.lines) == "table" then #params.lines else 0
+		return string.format("Voice %s", plural(lines, "line"))
 	end,
 
 	["character.moveTo"] = function(params)
@@ -665,6 +698,10 @@ local DESCRIBERS: { [string]: Describer } = {
 	["viewport.ui"] = function()
 		return "Check the interface for layout faults"
 	end,
+	["viewport.uisnap"] = function(params)
+		local where = leaf(params.path)
+		return if where ~= nil then "Snapshot the interface in " .. where else "Snapshot the interface"
+	end,
 	["viewport.textbounds"] = function(params)
 		local name = leaf(params.path)
 		return if name ~= nil then "Measure the text in " .. name else "Measure some text"
@@ -762,6 +799,16 @@ local DESCRIBERS: { [string]: Describer } = {
 	["terrain.stats"] = function()
 		return "Measure the terrain"
 	end,
+	["terrain.materials"] = function(params)
+		local action = tostring(params.action or "list")
+		local count = if typeof(params.slots) == "table" then #params.slots else 0
+		if action == "set" then
+			return string.format("Set %s", plural(count, "terrain material"))
+		elseif action == "reset" then
+			return string.format("Reset %s", plural(count, "terrain material"))
+		end
+		return "List terrain materials"
+	end,
 
 	["device.list"] = function()
 		return "List devices"
@@ -787,6 +834,7 @@ local DESCRIBERS: { [string]: Describer } = {
 ]]
 local KINDS: { [string]: string } = {
 	discover = "read",
+	client = "read",
 	studio = "read",
 	viewport = "read",
 	capture = "read",
@@ -803,6 +851,8 @@ local KINDS: { [string]: string } = {
 	debug = "debug",
 	perf = "debug",
 	api = "read",
+	-- Only feeds Script Analysis; no instance or source changes.
+	analysis = "read",
 	device = "read",
 	-- Casts and overlap tests only look; nothing in the group writes.
 	spatial = "read",
@@ -824,7 +874,7 @@ local KINDS: { [string]: string } = {
 	sync = "write",
 }
 
-function Phrase.kindOf(op: string): string
+function Phrase.kindOf(op: string, params: { [string]: any }?): string
 	local group = string.match(op, "^([^%.]+)%.") or op
 	-- Reads within the script group, writes outside it: a script edit changes
 	-- the game, a read or a grep does not, and they are far apart in weight.
@@ -834,6 +884,12 @@ function Phrase.kindOf(op: string): string
 	end
 	-- Same shape as the script group: one read sitting among writes.
 	if op == "audio.inspect" or op == "anim.read" then
+		return "read"
+	end
+	if op == "terrain.stats" then
+		return "read"
+	end
+	if op == "terrain.materials" and (params == nil or params.action == nil or params.action == "list") then
 		return "read"
 	end
 	if op == "sync.scan" or op == "sync.shape" or op == "sync.revisions" or op == "sync.read" or op == "sync.changes" or op == "sync.classes" or op == "sync.export" then
